@@ -1,10 +1,14 @@
 #![forbid(unsafe_code)]
 
 use braid_proto::{
-    CellStyle, CursorShape, GridSize, MAX_RUN_BYTES, ModeSet, REPAINT_MODES, RowFrame, StickyState,
-    StyleAttrs, StyleColor, StyleRun, UnderlineStyle,
+    CellStyle, CursorShape, EXCLUSIVE_MASK, EXCLUSIVE_MODES, GridSize, MAX_RUN_BYTES, ModeSet,
+    REPAINT_MODES, RowFrame, StickyState, StyleAttrs, StyleColor, StyleRun, UnderlineStyle,
 };
 use libghostty_vt::fmt::Format;
+use libghostty_vt::mouse::{
+    Action, Button, Encoder, EncoderSize, Event, Format as MouseFormat, Position as MousePosition,
+    TrackingMode,
+};
 use libghostty_vt::render::CursorVisualStyle;
 use libghostty_vt::screen::{CellWide, Screen};
 use libghostty_vt::selection::FormatOptions;
@@ -65,6 +69,195 @@ const DEVICE_ATTRIBUTES: DeviceAttributes = DeviceAttributes {
     },
     tertiary: TertiaryDeviceAttributes { unit_id: 0 },
 };
+
+/// Reads back the two mouse values a terminal actually acts on.
+///
+/// Ghostty holds `mouse_event` and `mouse_format` as one value each, and exposes an
+/// accessor for neither: `ghostty_terminal_get`'s `MOUSE_TRACKING` is an `or` over the
+/// mode *bits*, and those record every member an application ever set rather than the
+/// one in force — `?1002h ?1000l` leaves the 1002 bit up on a terminal reporting
+/// nothing. What is exposed is `set_options_from_terminal`, which copies both values
+/// into a mouse encoder. So the values are read by encoding fixed probe events and
+/// finding the candidate configuration that encodes them the same way: the encoder is
+/// the function a terminal reports with, so a candidate agreeing on every probe *is*
+/// the terminal's value. Nothing here knows what a mouse report looks like.
+struct MouseProbe {
+    /// Seeded from the terminal on every read: which probes it answers gives the
+    /// tracking mode, and forcing it to report afterwards gives the format even where
+    /// tracking is off and a terminal would send nothing.
+    encoder: Encoder<'static>,
+    /// Reused: `Event::new` is an allocation, and a probe varies only in its action
+    /// and its button.
+    event: Event<'static>,
+    /// Per tracking mode, which probes produce output.
+    answered: [[bool; PROBES.len()]; TRACKING.len()],
+    /// Per format, the bytes a press probe encodes to.
+    pressed: [Vec<u8>; FORMATS.len()],
+    scratch: Vec<u8>,
+}
+
+/// Position `i` is member `i - 1` of the matching [`EXCLUSIVE_MODES`] group; index
+/// zero is the group turned off, which no mode bit spells.
+/// `each_mouse_mode_reaches_its_own_bit` holds these to that correspondence.
+const TRACKING: [TrackingMode; 5] = [
+    TrackingMode::None,
+    TrackingMode::X10,
+    TrackingMode::Normal,
+    TrackingMode::Button,
+    TrackingMode::Any,
+];
+
+/// Ordered like [`TRACKING`], against the format group: `Urxvt` before `Sgr` because
+/// [`EXCLUSIVE_MODES`] runs least to most capable and not by mode number.
+const FORMATS: [MouseFormat; 5] = [
+    MouseFormat::X10,
+    MouseFormat::Utf8,
+    MouseFormat::Urxvt,
+    MouseFormat::Sgr,
+    MouseFormat::SgrPixels,
+];
+
+/// A press, a release, a drag and a bare motion: the four a terminal answers in
+/// different subsets, which is the whole of what separates the tracking modes. The
+/// press is also what a format is read with, since every format encodes one.
+const PROBES: [(Action, bool); 4] = [
+    (Action::Press, true),
+    (Action::Release, true),
+    (Action::Motion, true),
+    (Action::Motion, false),
+];
+
+const _: () = assert!(TRACKING.len() == EXCLUSIVE_MODES[0].len() + 1);
+const _: () = assert!(FORMATS.len() == EXCLUSIVE_MODES[1].len() + 1);
+
+/// Past column 95 the X10 and UTF-8 encodings of the same column differ, and below
+/// 223 X10 can still spell it: a probe anywhere else leaves two formats identical.
+/// `u16`, so the surface position below is a widening and never a rounding.
+const PROBE_COL: u16 = 150;
+const PROBE_ROW: u16 = 2;
+const PROBE_CELL: u16 = 8;
+
+/// No sequence is longer than a `sgr_pixels` report of the probe position, so the
+/// scratch buffer never has to grow: `encode_to_vec` reserves only when the spare
+/// capacity is short.
+const PROBE_BYTES: usize = 32;
+
+impl MouseProbe {
+    fn new() -> Result<Self, VtError> {
+        let mut event = Self::event()?;
+        let mut scratch = Vec::with_capacity(PROBE_BYTES);
+        let mut answered = [[false; PROBES.len()]; TRACKING.len()];
+        for (row, tracking) in answered.iter_mut().zip(TRACKING) {
+            let mut encoder = Self::encoder()?;
+            encoder.set_tracking_mode(tracking);
+            for (slot, (action, held)) in row.iter_mut().zip(PROBES) {
+                Self::emit(&mut encoder, &mut event, action, held, &mut scratch)?;
+                *slot = !scratch.is_empty();
+            }
+        }
+        let mut pressed = [const { Vec::new() }; FORMATS.len()];
+        for (slot, format) in pressed.iter_mut().zip(FORMATS) {
+            let mut encoder = Self::encoder()?;
+            encoder.set_tracking_mode(TrackingMode::Any);
+            encoder.set_format(format);
+            let (action, held) = PROBES[0];
+            Self::emit(&mut encoder, &mut event, action, held, slot)?;
+        }
+        Ok(Self {
+            encoder: Self::encoder()?,
+            event,
+            answered,
+            pressed,
+            scratch,
+        })
+    }
+
+    fn encoder() -> Result<Encoder<'static>, VtError> {
+        let mut encoder = Encoder::new().map_err(ghostty)?;
+        encoder.set_size(EncoderSize {
+            screen_width: u32::from((PROBE_COL + 2) * PROBE_CELL),
+            screen_height: u32::from((PROBE_ROW + 2) * PROBE_CELL),
+            cell_width: u32::from(PROBE_CELL),
+            cell_height: u32::from(PROBE_CELL),
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        });
+        // Motion dedupe would answer for the previous probe rather than this one.
+        encoder.set_track_last_cell(false);
+        Ok(encoder)
+    }
+
+    /// Every probe is at the same place; only the action and the button move.
+    fn event() -> Result<Event<'static>, VtError> {
+        let mut event = Event::new().map_err(ghostty)?;
+        event.set_position(MousePosition {
+            x: f32::from(PROBE_COL * PROBE_CELL),
+            y: f32::from(PROBE_ROW * PROBE_CELL),
+        });
+        Ok(event)
+    }
+
+    fn emit(
+        encoder: &mut Encoder<'static>,
+        event: &mut Event<'static>,
+        action: Action,
+        held: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<(), VtError> {
+        event.set_action(action);
+        event.set_button((held || !matches!(action, Action::Motion)).then_some(Button::Left));
+        encoder.set_any_button_pressed(held);
+        out.clear();
+        encoder.encode_to_vec(event, out).map_err(ghostty)
+    }
+
+    /// The mode each [`EXCLUSIVE_MODES`] group is in, as the mode number that spells
+    /// it; `None` is the group off. A terminal whose encoder matches no candidate is
+    /// one this build cannot describe, and reporting it off is the safe read.
+    fn read(
+        &mut self,
+        terminal: &Terminal<'_, '_>,
+    ) -> Result<[Option<u16>; EXCLUSIVE_MODES.len()], VtError> {
+        self.encoder.set_options_from_terminal(terminal);
+        let mut answers = [false; PROBES.len()];
+        for (slot, (action, held)) in answers.iter_mut().zip(PROBES) {
+            Self::emit(
+                &mut self.encoder,
+                &mut self.event,
+                action,
+                held,
+                &mut self.scratch,
+            )?;
+            *slot = !self.scratch.is_empty();
+        }
+        let tracking = self.answered.iter().position(|row| *row == answers);
+
+        // The options above less the tracking, which decides only whether a terminal
+        // answers at all; the next read seeds both from the terminal again.
+        self.encoder.set_tracking_mode(TrackingMode::Any);
+        let (action, held) = PROBES[0];
+        Self::emit(
+            &mut self.encoder,
+            &mut self.event,
+            action,
+            held,
+            &mut self.scratch,
+        )?;
+        let format = self
+            .pressed
+            .iter()
+            .position(|candidate| *candidate == self.scratch);
+
+        Ok([member(0, tracking), member(1, format)])
+    }
+}
+
+/// Candidate zero is the group off, and so is a terminal no candidate matched.
+fn member(group: usize, candidate: Option<usize>) -> Option<u16> {
+    Some(EXCLUSIVE_MODES[group][candidate?.checked_sub(1)?])
+}
 
 /// A set of rows, one bit each.
 ///
@@ -367,6 +560,8 @@ pub struct VtEngine<S> {
     bell: Rc<Cell<bool>>,
     title: Option<Arc<str>>,
     sink: Rc<S>,
+    /// Held rather than built per repaint: its candidate tables are fixed.
+    mouse: MouseProbe,
     panicked: CaughtPanic,
 }
 
@@ -453,6 +648,7 @@ impl<S: EffectSink + 'static> VtEngine<S> {
             bell,
             title: None,
             sink,
+            mouse: MouseProbe::new()?,
             panicked,
         })
     }
@@ -638,14 +834,22 @@ impl<S: EffectSink + 'static> VtEngine<S> {
         Ok(matches)
     }
 
-    fn modes(&self) -> Result<ModeSet, VtError> {
+    /// The mouse groups come from [`MouseProbe`] rather than from the mode bits: the
+    /// bits carry every member an application ever set, and a terminal holds one.
+    fn modes(&mut self) -> Result<ModeSet, VtError> {
         let mut modes = ModeSet::empty();
         for (index, number) in REPAINT_MODES.into_iter().enumerate() {
+            if EXCLUSIVE_MASK.get(index) {
+                continue;
+            }
             let on = self
                 .terminal
                 .mode(Mode::new(number, ModeKind::Dec))
                 .map_err(ghostty)?;
             modes.set(index, on);
+        }
+        for (group, selected) in self.mouse.read(&self.terminal)?.into_iter().enumerate() {
+            modes.select(group, selected);
         }
         Ok(modes)
     }
@@ -1091,6 +1295,94 @@ mod tests {
         assert!(on.contains(&2004), "bracketed paste: {on:?}");
         assert!(on.contains(&1006), "sgr mouse: {on:?}");
         assert!(!on.contains(&1003), "any-event mouse must stay off: {on:?}");
+    }
+
+    /// [`MouseProbe`] reads a value out of the emulator; this holds that value to the
+    /// DEC mode that set it. Without it the lists in `MouseProbe` could drift from
+    /// `EXCLUSIVE_MODES` and every restatement would name a neighbouring mode.
+    #[test]
+    fn each_mouse_mode_reaches_its_own_bit() {
+        for (group, members) in EXCLUSIVE_MODES.into_iter().enumerate() {
+            for mode in members {
+                let mut engine = engine(8, 2);
+                // Tracking first: with none, no report is sent and no format shows.
+                engine
+                    .feed(format!("\x1b[?1003h\x1b[?{mode}h").as_bytes())
+                    .unwrap();
+                let expected = if group == 0 {
+                    [Some(mode), None]
+                } else {
+                    [Some(1003), Some(mode)]
+                };
+                assert_eq!(
+                    engine.repaint().unwrap().modes.selections(),
+                    expected,
+                    "mode {mode}"
+                );
+            }
+        }
+    }
+
+    /// What the mode bits get wrong, because a bit records that a member was set and
+    /// never that a later sequence took it back.
+    #[test]
+    fn a_mouse_group_follows_the_sequence_and_not_the_bits() {
+        for (stream, expected, why) in [
+            (
+                &b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h"[..],
+                [Some(1003), Some(1006)],
+                "widening, which is what every application does",
+            ),
+            (
+                &b"\x1b[?1003h\x1b[?1002h\x1b[?9h"[..],
+                [Some(9), None],
+                "narrowed twice, with every wider member still lit",
+            ),
+            (
+                &b"\x1b[?1002h\x1b[?1006h\x1b[?1000l"[..],
+                [None, Some(1006)],
+                "cleared through a member that was never set",
+            ),
+            (
+                &b"\x1b[?1006h\x1b[?1015h"[..],
+                [None, Some(1015)],
+                "an encoding chosen after a better one, and never reported",
+            ),
+        ] {
+            let mut engine = engine(8, 2);
+            engine.feed(stream).unwrap();
+            assert_eq!(
+                engine.repaint().unwrap().modes.selections(),
+                expected,
+                "{why}"
+            );
+        }
+    }
+
+    /// A probe set that cannot separate two values reads one of them as the other,
+    /// silently. Ghostty deciding to encode two of these alike is the way that starts.
+    #[test]
+    fn the_probe_set_separates_every_mouse_value() {
+        let probe = MouseProbe::new().expect("a probe");
+        for (index, row) in probe.answered.iter().enumerate() {
+            for (other, against) in probe.answered.iter().enumerate().skip(index + 1) {
+                assert_ne!(
+                    row, against,
+                    "{:?} and {:?} answer the same probes",
+                    TRACKING[index], TRACKING[other]
+                );
+            }
+        }
+        for (index, press) in probe.pressed.iter().enumerate() {
+            assert!(!press.is_empty(), "{:?} encoded no press", FORMATS[index]);
+            for (other, against) in probe.pressed.iter().enumerate().skip(index + 1) {
+                assert_ne!(
+                    press, against,
+                    "{:?} and {:?} encode a press alike",
+                    FORMATS[index], FORMATS[other]
+                );
+            }
+        }
     }
 
     /// The unset case is load-bearing: a session that never issued DECSCUSR

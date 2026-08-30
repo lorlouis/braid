@@ -5,9 +5,9 @@
 
 use braid_proto::screen::MAX_CLUSTER_BYTES;
 use braid_proto::{
-    ByteOff, CellStyle, CursorShape, Generation, GridSize, MAX_TITLE, ModeSet, REPAINT_MODES,
-    RESET_ON_EXIT, RowFrame, RowSpan, ScreenHeader, ScreenPart, ScreenVersion, ScrollBand,
-    StickyState, StyleAttrs, StyleColor, UnderlineStyle,
+    ByteOff, CellStyle, CursorShape, EXCLUSIVE_MASK, EXCLUSIVE_MODES, Generation, GridSize,
+    MAX_TITLE, ModeSet, REPAINT_MODES, RESET_ON_EXIT, RowFrame, RowSpan, ScreenHeader, ScreenPart,
+    ScreenVersion, ScrollBand, StickyState, StyleAttrs, StyleColor, UnderlineStyle,
 };
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -1184,16 +1184,47 @@ fn write_sticky<W: Write>(
 }
 
 /// `None` means the terminal's state is unknown and every mode is restated.
+///
+/// A mode in [`EXCLUSIVE_MASK`] is restated as its group's selection and never on its
+/// own: the members share one value in the terminal, so a `DECRST` for the members a
+/// screen does not select would clear the one it does.
 fn write_modes<W: Write>(
     output: &mut W,
     modes: ModeSet,
     previous: Option<ModeSet>,
 ) -> io::Result<()> {
     for (index, (mode, on)) in modes.iter().enumerate() {
+        if EXCLUSIVE_MASK.get(index) {
+            continue;
+        }
         if previous.is_some_and(|previous| previous.get(index) == on) {
             continue;
         }
         write!(output, "\x1b[?{}{}", mode, if on { 'h' } else { 'l' })?;
+    }
+    let believed = previous.map(ModeSet::selections);
+    for (index, (members, selected)) in EXCLUSIVE_MODES
+        .into_iter()
+        .zip(modes.selections())
+        .enumerate()
+    {
+        if believed.is_some_and(|believed| believed[index] == selected) {
+            continue;
+        }
+        // Every other member, then the selection last. Terminals agree that a group is
+        // one value and that the last `DECSET` wins, and disagree about a `DECRST`
+        // naming a member that is not the active one: Ghostty clears the group, xterm
+        // does so for tracking but not for the encoding, foot for neither. Clearing
+        // first and setting last is the one order that lands the same on all of them.
+        for member in members
+            .into_iter()
+            .filter(|member| Some(*member) != selected)
+        {
+            write!(output, "\x1b[?{member}l")?;
+        }
+        if let Some(mode) = selected {
+            write!(output, "\x1b[?{mode}h")?;
+        }
     }
     Ok(())
 }
@@ -2291,6 +2322,123 @@ mod tests {
         third.modes.set(13, true);
         let rendered = paint_head(&mut screen, third, vec![RowFrame::default()]);
         assert!(rendered.contains("\x1b[?1049h"), "{rendered:?}");
+    }
+
+    /// What a `DECRST` naming a member that is not the group's active one does. Every
+    /// terminal keeps a group as one value and lets the last `DECSET` win; this is the
+    /// whole of what they disagree about, so it is the whole of what a restatement has
+    /// to survive.
+    #[derive(Clone, Copy)]
+    enum Reset {
+        /// Ghostty, `src/termio/stream_handler.zig`: any member clears the group.
+        Clears,
+        /// xterm, `charproc.c`: "a reset is only effective against the matching mode".
+        /// foot, `csi.c`, does the same for tracking, which xterm does not.
+        Matching,
+    }
+
+    const TERMINALS: [(&str, [Reset; EXCLUSIVE_MODES.len()]); 3] = [
+        ("ghostty", [Reset::Clears, Reset::Clears]),
+        ("xterm", [Reset::Clears, Reset::Matching]),
+        ("foot", [Reset::Matching, Reset::Matching]),
+    ];
+
+    /// `held` folded by what `rendered` tells a terminal that resets like `resets`.
+    fn mouse_held(
+        resets: [Reset; EXCLUSIVE_MODES.len()],
+        mut held: [Option<u16>; EXCLUSIVE_MODES.len()],
+        rendered: &str,
+    ) -> [Option<u16>; EXCLUSIVE_MODES.len()] {
+        let mut rest = rendered;
+        while let Some(start) = rest.find("\x1b[?") {
+            rest = &rest[start + 3..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            let (digits, tail) = rest.split_at(end);
+            let (Ok(mode), Some(action)) = (digits.parse::<u16>(), tail.chars().next()) else {
+                continue;
+            };
+            let on = match action {
+                'h' => true,
+                'l' => false,
+                _ => continue,
+            };
+            for ((slot, group), reset) in held.iter_mut().zip(EXCLUSIVE_MODES).zip(resets) {
+                if !group.contains(&mode) {
+                    continue;
+                }
+                *slot = match (on, reset) {
+                    (true, _) => Some(mode),
+                    (false, Reset::Clears) => None,
+                    (false, Reset::Matching) => slot.filter(|active| *active != mode),
+                };
+            }
+        }
+        held
+    }
+
+    fn modes_of(modes: &[u16]) -> ModeSet {
+        let mut set = ModeSet::empty();
+        for mode in modes {
+            let index = REPAINT_MODES
+                .iter()
+                .position(|named| named == mode)
+                .expect("a named mode");
+            set.set(index, true);
+        }
+        set
+    }
+
+    /// Mouse reporting is one value in the terminal, not a bit per mode, so restating
+    /// the table one mode at a time ends on the two members it names last — 1016 and
+    /// 9, both off — and a resumed session stops receiving clicks it is still asking
+    /// for. Held against every terminal in [`TERMINALS`], because a restatement that
+    /// is only right about one of them is the same defect one implementation along.
+    #[test]
+    fn a_repaint_leaves_the_mouse_reporting_the_session_asked_for() {
+        let size = GridSize { cols: 4, rows: 1 };
+        let version = ScreenVersion::initial();
+        // What `zellij` leaves in the emulator: tracking widened twice, urxvt then SGR.
+        let mouse = modes_of(&[1000, 1002, 1003, 1015, 1006]);
+        let selected = [Some(1003), Some(1006)];
+
+        for (terminal, resets) in TERMINALS {
+            let mut screen = Screen::default();
+            let first = ScreenHeader {
+                modes: mouse,
+                ..header(size)
+            };
+            let rendered = paint_head(&mut screen, first, vec![RowFrame::default()]);
+            assert_eq!(
+                mouse_held(resets, [None, None], &rendered),
+                selected,
+                "{terminal}: {rendered:?}"
+            );
+
+            // A replaced transport believes nothing, so this restates every mode.
+            screen.invalidate();
+            let resumed = ScreenHeader {
+                modes: mouse,
+                ..at(size, version.next())
+            };
+            let rendered = paint_head(&mut screen, resumed, vec![RowFrame::default()]);
+            assert_eq!(
+                mouse_held(resets, selected, &rendered),
+                selected,
+                "{terminal}: {rendered:?}"
+            );
+
+            // And a session that turned the mouse off reaches a terminal holding it.
+            screen.invalidate();
+            let quiet = at(size, version.next().next());
+            let rendered = paint_head(&mut screen, quiet, vec![RowFrame::default()]);
+            assert_eq!(
+                mouse_held(resets, selected, &rendered),
+                [None, None],
+                "{terminal}: {rendered:?}"
+            );
+        }
     }
 
     /// The first repaint after a reconnect is where a title, a bell and a
