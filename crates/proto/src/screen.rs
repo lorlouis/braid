@@ -538,19 +538,86 @@ pub const REPAINT_MODES: [u16; 20] = [
 
 const _: () = assert!(REPAINT_MODES.len() <= u32::BITS as usize);
 
-/// Modes an exiting client owes the terminal a `DECRST` for. DECAWM (7) and grapheme
-/// clustering (2027) are excluded: for those, "off" would be a change, not an undo.
+/// Modes an exiting client owes the terminal a `DECRST` for. DECAWM (7), grapheme
+/// clustering (2027), alternate scroll (1007) and meta-sends-escape (1036) are excluded:
+/// each is on in an untouched terminal, so for those "off" would be a change, not an
+/// undo — an exit that clears 1036 leaves the user's own shell with a dead Alt key.
 pub const RESET_ON_EXIT: ModeSet = {
     let mut set = ModeSet::empty();
     let mut index = 0;
     while index < REPAINT_MODES.len() {
-        if REPAINT_MODES[index] != 7 && REPAINT_MODES[index] != 2027 {
-            set.set(index, true);
+        match REPAINT_MODES[index] {
+            7 | 1007 | 1036 | 2027 => {}
+            _ => set.set(index, true),
         }
         index += 1;
     }
     set
 };
+
+/// DEC modes a terminal keeps as one selection rather than as independent flags.
+/// Mouse reporting is two of them — when a report is sent, and how it is encoded —
+/// and every terminal holds a single value for each, decided by the last `DECSET`.
+/// What they disagree about is a `DECRST` naming a member that is not the active one:
+/// Ghostty clears the group, xterm does so for tracking but ignores it for the
+/// encoding ("a reset is only effective against the matching mode"), foot ignores it
+/// for both. A group is therefore restated by clearing every other member and setting
+/// the selection last, the one order all three land the same on; restating bit by bit
+/// in table order ends instead on whichever member this table names last, `9` and
+/// `1016`, both off.
+///
+/// Order is the wire's, and `braid_vt` reads the emulator's own value against it —
+/// member `i` here is value `i + 1` in the lists its `MouseProbe` searches, held to
+/// that by `each_mouse_mode_reaches_its_own_bit`. It also runs least to most capable,
+/// which is what [`ModeSet::selections`] falls back on for a peer that sent a group
+/// no terminal could have been in.
+pub const EXCLUSIVE_MODES: [[u16; 4]; 2] = [
+    [9, 1000, 1002, 1003],    // when the terminal reports the mouse
+    [1005, 1015, 1006, 1016], // how it encodes the report
+];
+
+/// [`EXCLUSIVE_MODES`] as positions in [`REPAINT_MODES`], resolved at compile time.
+const EXCLUSIVE: [[usize; EXCLUSIVE_MODES[0].len()]; EXCLUSIVE_MODES.len()] = {
+    let mut groups = [[0_usize; EXCLUSIVE_MODES[0].len()]; EXCLUSIVE_MODES.len()];
+    let mut group = 0;
+    while group < EXCLUSIVE_MODES.len() {
+        let mut member = 0;
+        while member < EXCLUSIVE_MODES[group].len() {
+            groups[group][member] = mode_index(EXCLUSIVE_MODES[group][member]);
+            member += 1;
+        }
+        group += 1;
+    }
+    groups
+};
+
+/// Every mode an [`EXCLUSIVE_MODES`] group names. A caller restating modes owes these
+/// [`ModeSet::selections`] and must not write a `DECSET` or `DECRST` for them itself.
+pub const EXCLUSIVE_MASK: ModeSet = {
+    let mut mask = ModeSet::empty();
+    let mut group = 0;
+    while group < EXCLUSIVE.len() {
+        let mut member = 0;
+        while member < EXCLUSIVE[group].len() {
+            mask.set(EXCLUSIVE[group][member], true);
+            member += 1;
+        }
+        group += 1;
+    }
+    mask
+};
+
+/// Compile-time, so a group naming a mode outside the table fails the build.
+const fn mode_index(mode: u16) -> usize {
+    let mut index = 0;
+    while index < REPAINT_MODES.len() {
+        if REPAINT_MODES[index] == mode {
+            return index;
+        }
+        index += 1;
+    }
+    panic!("an exclusive group names a mode REPAINT_MODES does not carry")
+}
 
 /// The on/off state of every mode in [`REPAINT_MODES`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -608,6 +675,48 @@ impl ModeSet {
             .into_iter()
             .enumerate()
             .map(move |(index, mode)| (mode, self.get(index)))
+    }
+
+    /// The mode each [`EXCLUSIVE_MODES`] group leaves a terminal holding, in that
+    /// order; `None` where the group is off. This, not the bits, is what a terminal
+    /// acts on, and restating a group is writing exactly this one mode.
+    ///
+    /// A set this workspace produced has one member per group at most, so the search
+    /// finds it outright. The order breaks the tie for a set that has more, which is
+    /// a peer that did not settle its groups: the most capable member is the only
+    /// defensible read, since bits do not record which `DECSET` came last.
+    #[must_use]
+    pub fn selections(self) -> [Option<u16>; EXCLUSIVE_MODES.len()] {
+        let mut selected = [None; EXCLUSIVE_MODES.len()];
+        for (slot, group) in selected.iter_mut().zip(EXCLUSIVE) {
+            *slot = group
+                .into_iter()
+                .rev()
+                .find(|index| self.get(*index))
+                .map(|index| REPAINT_MODES[index]);
+        }
+        selected
+    }
+
+    /// Put `group` in `mode`, clearing every member that excludes it; `None` turns the
+    /// group off. A group is one value in the terminal, so a set that describes one is
+    /// built only here: writing the bits directly can spell a state no terminal can be
+    /// in, which is what the client's `lit` union is and why it is never rendered.
+    ///
+    /// # Panics
+    ///
+    /// If `mode` is not a member of `group`.
+    pub fn select(&mut self, group: usize, mode: Option<u16>) {
+        let members = EXCLUSIVE[group];
+        let selected = mode.map(|mode| {
+            members
+                .into_iter()
+                .find(|index| REPAINT_MODES[*index] == mode)
+                .expect("a mode the group names")
+        });
+        for index in members {
+            self.set(index, Some(index) == selected);
+        }
     }
 }
 
@@ -933,6 +1042,62 @@ mod tests {
         // two spellings of one frame is how a byte gets past someone else's length.
         assert_eq!(ModeSet::from_bits(1 << 31), ModeSet::empty());
         assert_eq!(ModeSet::decode(1 << REPAINT_MODES.len()), None);
+    }
+
+    /// A terminal holds one value per mouse group, so only [`ModeSet::select`] may set
+    /// one: it is the only writer that cannot spell a state no terminal can be in.
+    #[test]
+    fn a_mouse_group_carries_one_member_and_selecting_clears_the_rest() {
+        let mut modes = ModeSet::empty();
+        let bracketed = mode_index(2004);
+        modes.set(bracketed, true);
+        assert_eq!(modes.selections(), [None, None], "a group nothing selected");
+
+        for (group, members) in EXCLUSIVE_MODES.into_iter().enumerate() {
+            let untouched = modes.selections();
+            for mode in members {
+                modes.select(group, Some(mode));
+                let selected = modes.selections();
+                assert_eq!(selected[group], Some(mode), "selecting {mode}");
+                for (other, holding) in selected.into_iter().enumerate() {
+                    assert!(
+                        other == group || holding == untouched[other],
+                        "selecting {mode} disturbed group {other}"
+                    );
+                }
+                let on: Vec<u16> = modes
+                    .iter()
+                    .filter_map(|(named, enabled)| enabled.then_some(named))
+                    .filter(|named| members.contains(named))
+                    .collect();
+                assert_eq!(on, vec![mode], "{mode} left a member of its own group up");
+            }
+            modes.select(group, None);
+            assert_eq!(modes.selections()[group], None, "clearing group {group}");
+        }
+        assert!(modes.get(bracketed), "a mode outside a group is untouched");
+
+        // Every member the mask names belongs to exactly one group, and every group
+        // member is in the mask: the renderer skips the mask and restates the groups.
+        for (index, (mode, _)) in ModeSet::empty().iter().enumerate() {
+            let groups = EXCLUSIVE_MODES
+                .iter()
+                .filter(|group| group.contains(&mode))
+                .count();
+            assert!(groups <= 1, "{mode} is named by two groups");
+            assert_eq!(EXCLUSIVE_MASK.get(index), groups == 1, "{mode}");
+        }
+    }
+
+    /// Bits from a peer that did not settle its groups still have to render as some
+    /// one mode, and the most capable member is the only defensible read.
+    #[test]
+    fn an_unsettled_group_reads_as_its_most_capable_member() {
+        let mut modes = ModeSet::empty();
+        for mode in [1000, 1002, 1003, 1015, 1006] {
+            modes.set(mode_index(mode), true);
+        }
+        assert_eq!(modes.selections(), [Some(1003), Some(1006)]);
     }
 
     #[test]

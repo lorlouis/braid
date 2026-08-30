@@ -12,9 +12,9 @@ use screen::{
     encode_sticky, has_control, reject_control, sticky_bytes,
 };
 pub use screen::{
-    CellStyle, CursorShape, MAX_DEFERRED, MAX_DEFERRED_BYTES, MAX_RUN_BYTES, MAX_TITLE, ModeSet,
-    REPAINT_MODES, RESET_ON_EXIT, RowChunk, RowChunks, RowFrame, ScrollBand, StickyState,
-    StyleAttrs, StyleColor, StyleRun, UnderlineStyle,
+    CellStyle, CursorShape, EXCLUSIVE_MASK, EXCLUSIVE_MODES, MAX_DEFERRED, MAX_DEFERRED_BYTES,
+    MAX_RUN_BYTES, MAX_TITLE, ModeSet, REPAINT_MODES, RESET_ON_EXIT, RowChunk, RowChunks, RowFrame,
+    ScrollBand, StickyState, StyleAttrs, StyleColor, StyleRun, UnderlineStyle,
 };
 
 pub const PROTOCOL_VERSION: u16 = 16;
