@@ -5,7 +5,7 @@
 //! process ssh starts, which finds or spawns a daemon and relays to it.
 
 use crate::state::{owner, private_dir, socket_name, state_dir};
-use crate::{FRAME_LENGTH_PREFIX, MANAGE_DEADLINE, RELAY_CHUNK, ServerError};
+use crate::{DaemonLock, FRAME_LENGTH_PREFIX, MANAGE_DEADLINE, RELAY_CHUNK, ServerError};
 use braid_proto::{
     ClientMessage, DatagramOffer, MAX_CLIENT_FRAME, MAX_FRAME, MAX_SESSIONS, ServerMessage,
     SessionId, SessionSummary, Version, read_frame, write_message,
@@ -202,11 +202,25 @@ fn manage_daemon(kill: Option<SessionId>) -> Vec<SessionSummary> {
 /// `None` means this socket did not answer, which is not the same as a daemon
 /// with no sessions.
 fn ask_daemon(path: &std::path::Path, kill: Option<SessionId>) -> Option<Vec<SessionSummary>> {
-    let Some(mut socket) = open_daemon_socket(path) else {
-        // Nothing answered the connect, which is what makes the inode stale. A
-        // socket that *did* connect is left alone whatever it does next.
-        let _ = fs::remove_file(path);
-        return None;
+    let mut socket = match open_daemon_socket(path) {
+        Probe::Answered(socket) => socket,
+        Probe::Unanswered => {
+            // Unlink only what nothing can be serving. The daemon holds this
+            // lock for its whole life, so taking it is what separates a dead
+            // inode from a full listen backlog, an `EMFILE` in *this* process
+            // and a daemon still binding - and unlinking a live daemon's socket
+            // strands every session on the host, because that daemon still
+            // holds the lock no replacement can take. It is the invariant
+            // `claim_socket` states: a daemon still starting keeps a stale
+            // predecessor's socket alive for one more invocation, which is the
+            // cheaper of the two mistakes.
+            if let Ok(Some(lock)) = DaemonLock::acquire() {
+                let _ = fs::remove_file(path);
+                drop(lock);
+            }
+            return None;
+        }
+        Probe::Unknown => return None,
     };
     // `brd ls` waiting forever on a wedged daemon is the same failure as
     // `brd ls` not reaching it at all.
@@ -232,15 +246,42 @@ pub(crate) fn exchange(
     }
 }
 
-fn open_daemon_socket(path: &std::path::Path) -> Option<UnixStream> {
+/// What was found on the daemon socket, at the resolution the caller needs:
+/// only a socket nothing is listening on is a candidate for unlinking.
+enum Probe {
+    Answered(UnixStream),
+    /// No inode, or a connect the kernel refused outright.
+    Unanswered,
+    /// The connect failed for a reason that says nothing about the daemon: a
+    /// descriptor limit here, a signal, a path this user does not own.
+    Unknown,
+}
+
+fn open_daemon_socket(path: &std::path::Path) -> Probe {
     use std::os::unix::fs::MetadataExt;
     // `symlink_metadata`, not `metadata`: a symlink planted here points at
     // something whose owner says nothing about who owns this path.
-    let meta = fs::symlink_metadata(path).ok()?;
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Probe::Unanswered,
+        Err(_) => return Probe::Unknown,
+    };
+    // Not this user's daemon, and so not this user's inode to sweep either.
     if meta.uid() != owner().as_raw() {
-        return None;
+        return Probe::Unknown;
     }
-    UnixStream::connect(path).ok()
+    match UnixStream::connect(path) {
+        Ok(socket) => Probe::Answered(socket),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Probe::Unanswered
+        }
+        Err(_) => Probe::Unknown,
+    }
 }
 
 /// [`state_dir`] can fall back to a world-writable temp directory, and another
@@ -343,6 +384,38 @@ mod tests {
             None,
             "a zeroed address is what absence already means on the wire"
         );
+    }
+
+    /// A live daemon holds the `flock` on `brd.lock` for its whole life, so a
+    /// socket unlinked out from under it can never be rebound: every session on
+    /// the host goes unreachable until that daemon dies. Only "nothing is
+    /// listening" may be read as stale — never a full listen backlog, and never
+    /// a descriptor limit in this process.
+    #[test]
+    fn only_a_socket_nothing_answers_is_read_as_stale() {
+        use std::os::unix::net::UnixListener;
+
+        let path = env::temp_dir().join(format!("brd-probe-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        assert!(
+            matches!(open_daemon_socket(&path), Probe::Unanswered),
+            "no inode at all"
+        );
+
+        let listener = UnixListener::bind(&path).expect("a listening socket");
+        assert!(
+            matches!(open_daemon_socket(&path), Probe::Answered(_)),
+            "a daemon that answers is never stale"
+        );
+
+        // The inode outlives the listener, which is what a daemon that died
+        // without unlinking leaves behind.
+        drop(listener);
+        assert!(
+            matches!(open_daemon_socket(&path), Probe::Unanswered),
+            "a refused connect is the one proof this inode is stale"
+        );
+        let _ = fs::remove_file(&path);
     }
 
     /// A stream fed from a socket the way the daemon feeds this one, with an

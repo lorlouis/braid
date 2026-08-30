@@ -18,6 +18,15 @@ const CANDIDATE_LOSSES: u8 = 2;
 /// Losses above the base size before the path is *suspected* of narrowing.
 pub const PMTU_BLACKHOLE_LOSSES: u32 = 3;
 
+/// Abandoned datagrams above the base size that add up to one such loss.
+///
+/// A declared loss needs a later packet acknowledged, and a window at its
+/// minimum holds exactly one oversize datagram — so behind a black hole
+/// nothing later is ever acknowledged and the packet threshold never fires.
+/// Silence would be the only signal left, and silence alone is not a narrow
+/// path, so it is discounted rather than believed.
+const PMTU_BLACKHOLE_SILENCES: u32 = 2;
+
 /// Data loss only raises the question; probes answer it.
 const CONFIRM_LOSSES: u8 = 2;
 
@@ -69,11 +78,16 @@ pub struct Mtu {
     next: usize,
     /// Packets above the base size lost since the last one that large arrived.
     blackhole: u32,
+    /// Oversize packets nobody mentioned since the last one that large arrived,
+    /// counted down into `blackhole` at [`PMTU_BLACKHOLE_SILENCES`] apiece.
+    silences: u32,
     /// The size an arrival must reach to end the run; against `plpmtu` a path
     /// carrying 3000 bytes would read as carrying none.
     suspect: usize,
     /// Without it a path that went down looks like one that narrowed.
     small_arrived: bool,
+    /// Kept so a migration can restore the premise the search opened on.
+    fragmentation: Fragmentation,
 }
 
 impl Mtu {
@@ -89,8 +103,10 @@ impl Mtu {
             },
             next: 0,
             blackhole: 0,
+            silences: 0,
             suspect: usize::MAX,
             small_arrived: false,
+            fragmentation,
         }
     }
 
@@ -104,6 +120,13 @@ impl Mtu {
         if matches!(self.search, Search::Unproven) {
             self.begin();
         }
+    }
+
+    /// A migration is a different path and `plpmtu` is a measurement of the one
+    /// it left, so RFC 8899 §5.4 restarts the search rather than carrying a
+    /// width across.
+    pub fn migrated(&mut self) {
+        *self = Self::new(self.fragmentation);
     }
 
     /// The caller pads to exactly this and reports the number through
@@ -205,6 +228,7 @@ impl Mtu {
     /// A queue still delivering three kilobytes still carries three kilobytes.
     fn withdraw(&mut self) {
         self.blackhole = 0;
+        self.silences = 0;
         self.suspect = usize::MAX;
         self.small_arrived = false;
         if matches!(self.search, Search::Confirming { .. }) {
@@ -217,7 +241,47 @@ impl Mtu {
         if self.probe_gone(number, now) {
             return;
         }
-        if bytes <= BASE_DATAGRAM || self.plpmtu <= BASE_DATAGRAM {
+        self.suspected(bytes, now);
+    }
+
+    /// The probe timer ran out on a datagram nobody mentioned.
+    ///
+    /// Says little about width on its own. But a window at its minimum carries
+    /// one oversize datagram, so behind a tunnel nothing later is ever
+    /// acknowledged, no loss is ever *declared*, and silence is the only signal
+    /// there is — which is why it is discounted by [`PMTU_BLACKHOLE_SILENCES`]
+    /// rather than ignored. A flood reaches [`crate::loss::Cause::Overflowed`]
+    /// instead, and that goes to [`forgotten`](Self::forgotten), which weighs nothing.
+    pub fn silent(&mut self, number: u64, bytes: usize, now: Instant) {
+        if self.probe_gone(number, now) {
+            return;
+        }
+        if !self.oversize(bytes) {
+            return;
+        }
+        self.silences += 1;
+        if self.silences < PMTU_BLACKHOLE_SILENCES {
+            return;
+        }
+        self.silences = 0;
+        self.suspected(bytes, now);
+    }
+
+    /// The flight table overflowed under a flood: nothing is known about this
+    /// datagram, so nothing but an outstanding probe's fate turns on it.
+    pub fn forgotten(&mut self, number: u64, now: Instant) {
+        self.probe_gone(number, now);
+    }
+
+    /// Nothing is left to narrow at the floor, and every path carries the base
+    /// size, so neither is evidence about width.
+    const fn oversize(&self, bytes: usize) -> bool {
+        bytes > BASE_DATAGRAM && self.plpmtu > BASE_DATAGRAM
+    }
+
+    /// One more piece of evidence that this path stopped carrying `bytes`.
+    fn suspected(&mut self, bytes: usize, now: Instant) {
+        if !self.oversize(bytes) {
             return;
         }
         self.blackhole += 1;
@@ -232,11 +296,6 @@ impl Mtu {
                 lost: 0,
             };
         }
-    }
-
-    /// Says nothing about width: a flood times big datagrams out on loopback.
-    pub fn abandoned(&mut self, number: u64, now: Instant) {
-        self.probe_gone(number, now);
     }
 
     /// The kernel refused a datagram this wide and named what the path does
@@ -460,17 +519,41 @@ mod tests {
         assert_eq!(mtu.poll(now), Some(1400), "then the search restarts");
     }
 
-    /// A flood on loopback outruns the peer's acks, so `lost` stays at zero.
+    /// A flood on loopback outruns the peer's acks and overflows the flight
+    /// table, which says nothing about width however often it happens.
     #[test]
-    fn packets_nobody_ever_mentioned_are_silence_rather_than_a_narrow_path() {
+    fn packets_the_flight_table_forgot_are_not_a_narrow_path() {
         let now = Instant::now();
         let mut mtu = grown(now);
         for number in 20..60 {
-            mtu.abandoned(number, now);
+            mtu.forgotten(number, now);
             mtu.acknowledged(number + 100, 120);
         }
-        assert_eq!(mtu.datagram(), 8900, "silence is not evidence of width");
+        assert_eq!(
+            mtu.datagram(),
+            8900,
+            "a full table is not evidence of width"
+        );
         assert_eq!(mtu.deadline(), None, "and nothing is being confirmed");
+    }
+
+    /// The case a window at its minimum leaves: one oversize datagram in
+    /// flight, nothing behind it to acknowledge it past, so the packet
+    /// threshold never fires and only the probe timer ever speaks.
+    #[test]
+    fn oversize_datagrams_that_only_ever_time_out_are_still_a_black_hole() {
+        let now = Instant::now();
+        let mut mtu = grown(now);
+        // Small ones keep arriving: that is what separates a narrowed path from
+        // one that went down.
+        for number in 20..20 + 2 * PMTU_BLACKHOLE_LOSSES * PMTU_BLACKHOLE_SILENCES {
+            mtu.acknowledged(u64::from(number) + 100, 120);
+            mtu.silent(u64::from(number), 8900, now);
+        }
+        assert!(
+            mtu.confirming(),
+            "silence on every oversize datagram never raised the question"
+        );
     }
 
     /// A link that went down entirely is not a black hole.
@@ -615,12 +698,37 @@ mod tests {
         mtu.acknowledged(10, 200);
         for number in 20..40 {
             mtu.lost(number, 8900, now);
-            mtu.abandoned(number + 100, now);
+            mtu.forgotten(number + 100, now);
         }
         now += COOLDOWN + PROBE_SPACING;
         assert_eq!(mtu.poll(now), None, "and no timer brings it back");
         assert_eq!(mtu.deadline(), None);
         assert!(!mtu.confirming());
         assert_eq!(mtu.datagram(), BASE_DATAGRAM);
+    }
+
+    /// A width is a measurement of the path it was taken on, and a migration
+    /// keeps none of the old path's measurements.
+    #[test]
+    fn a_migration_puts_the_search_back_where_an_unprobed_path_starts() {
+        let now = Instant::now();
+        let mut mtu = grown(now);
+        assert_eq!(mtu.poll(now), None, "settled above the base");
+
+        mtu.migrated();
+        assert_eq!(mtu.datagram(), BASE_DATAGRAM);
+        assert_eq!(mtu.poll(now), None, "and this path has proved nothing");
+        mtu.proven();
+        assert_eq!(probed(&mut mtu, now, 100), 1400, "it asks from the bottom");
+
+        // The premise the caller opened on survives, since the socket did not.
+        let mut mtu = Mtu::new(Fragmentation::Permitted);
+        mtu.migrated();
+        mtu.proven();
+        assert_eq!(
+            mtu.poll(now),
+            None,
+            "a fragmenting socket still proves nothing"
+        );
     }
 }

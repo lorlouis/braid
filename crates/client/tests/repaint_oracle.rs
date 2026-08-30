@@ -36,8 +36,9 @@ const DATAGRAM_BUDGET: usize = MIN_DATAGRAM_FRAME;
 const BUDGETS: [(&str, usize); 2] = [("stream", STREAM_BUDGET), ("datagram", DATAGRAM_BUDGET)];
 
 /// Below any real MTU: the largest budget that cuts every capture here into
-/// pieces. `MIN_DATAGRAM_FRAME` carries an eighty-column screen whole.
-const CUT_BUDGET: usize = 160;
+/// pieces, and small enough that at least one is cut *across* a row.
+/// `MIN_DATAGRAM_FRAME` carries an eighty-column screen whole.
+const CUT_BUDGET: usize = 140;
 
 const CLEAR_VIEWPORT: &[u8] = b"\x1b[2J";
 

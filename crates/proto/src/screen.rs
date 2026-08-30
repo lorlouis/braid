@@ -318,15 +318,15 @@ impl RowChunk<'_> {
 pub(crate) const CHUNK_FIXED: usize = 8;
 
 /// A run's two extents, its attributes and its underline shape, before its colours.
-const RUN_FIXED: usize = 8;
+const RUN_FIXED: usize = 6;
 
 fn style_len(runs: &[StyleRun]) -> usize {
     runs.iter().map(|run| run.style_len()).sum()
 }
 
-/// Two of cells, four of bytes, one each of attrs and underline, one per shortest
+/// Two of cells, two of bytes, one each of attrs and underline, one per shortest
 /// colour: what the payload could hold, so a run count alone cannot drive a reserve.
-pub(crate) const MIN_RUN_BYTES: usize = 11;
+pub(crate) const MIN_RUN_BYTES: usize = 9;
 
 /// Row text is bounded by `MAX_COLS * MAX_CLUSTER_BYTES`, so the saturation is
 /// unreachable; it keeps the offset off a panicking path.
@@ -803,7 +803,13 @@ pub(crate) fn encode_row_chunk(out: &mut Vec<u8>, chunk: &RowChunk<'_>) -> Resul
     put_u16(out, count);
     for run in chunk.runs {
         put_u16(out, run.cells);
-        put_u32(out, run.bytes);
+        // Two octets, not four: the encoder bounds a run at `MAX_RUN_BYTES` and the
+        // decoder refuses anything wider, so the top half was structurally zero.
+        let run_bytes = u16::try_from(run.bytes)
+            .ok()
+            .filter(|&bytes| u32::from(bytes) <= MAX_RUN_BYTES)
+            .ok_or(EncodeError::Oversize)?;
+        put_u16(out, run_bytes);
         out.push(run.style.attrs.bits());
         out.push(run.style.underline.to_wire());
         encode_style_color(out, run.style.fg);
@@ -846,7 +852,13 @@ pub(crate) fn decode_row_frame(c: &mut Cursor<'_>, cols: u16) -> Result<RowFrame
     let mut covered_bytes = 0_usize;
     for _ in 0..count {
         let run_cells = c.u16()?;
-        let run_bytes = c.u32()?;
+        // The encoder's own bound, restated here: without it a decoded row could carry
+        // a run the re-encode refuses, which the repaint oracle would find and the
+        // fuzzer would find faster.
+        let run_bytes = c.u16()?;
+        if u32::from(run_bytes) > MAX_RUN_BYTES {
+            return Err(DecodeError::InvalidField);
+        }
         let attrs = StyleAttrs::from_bits(c.take(1)?[0]);
         let underline =
             UnderlineStyle::from_wire(c.take(1)?[0]).ok_or(DecodeError::InvalidField)?;
@@ -855,14 +867,14 @@ pub(crate) fn decode_row_frame(c: &mut Cursor<'_>, cols: u16) -> Result<RowFrame
         let underline_color = decode_style_color(c)?;
         covered_cells += u32::from(run_cells);
         covered_bytes = covered_bytes
-            .checked_add(usize::try_from(run_bytes).map_err(|_| DecodeError::InvalidField)?)
+            .checked_add(usize::from(run_bytes))
             .ok_or(DecodeError::InvalidField)?;
         if covered_cells > u32::from(cells) || !text.is_char_boundary(covered_bytes) {
             return Err(DecodeError::InvalidField);
         }
         runs.push(StyleRun {
             cells: run_cells,
-            bytes: run_bytes,
+            bytes: u32::from(run_bytes),
             style: CellStyle {
                 fg,
                 bg,
@@ -1034,6 +1046,47 @@ mod tests {
         put_u16(&mut hostile, 0);
         assert!(matches!(
             decode_row_frame(&mut Cursor::new(&hostile), 80),
+            Err(DecodeError::InvalidField)
+        ));
+    }
+
+    /// The extent is two octets on the wire because `MAX_RUN_BYTES` bounds it, so both
+    /// ends have to hold that bound rather than one end merely happening to.
+    #[test]
+    fn a_run_wider_than_its_own_bound_is_refused_at_both_ends() {
+        let wide = usize::try_from(MAX_RUN_BYTES).expect("a small bound") + 1;
+        // Cells well past the extent, so the row's own byte-per-cell bound is not what
+        // refuses this and the run's extent is.
+        let over = RowFrame {
+            text: "x".repeat(wide),
+            cells: 1024,
+            runs: vec![StyleRun {
+                cells: 1024,
+                bytes: MAX_RUN_BYTES + 1,
+                style: CellStyle::default(),
+            }],
+        };
+        let mut out = Vec::new();
+        assert!(matches!(
+            encode_whole(&mut out, &over),
+            Err(EncodeError::Oversize)
+        ));
+
+        // A frame this side cannot write is still one a peer can state.
+        let mut hostile = Vec::new();
+        put_u32(&mut hostile, u32::try_from(wide).expect("a short row"));
+        hostile.extend_from_slice("x".repeat(wide).as_bytes());
+        put_u16(&mut hostile, 1024);
+        put_u16(&mut hostile, 1);
+        put_u16(&mut hostile, 1024);
+        put_u16(
+            &mut hostile,
+            u16::try_from(MAX_RUN_BYTES).expect("a small bound") + 1,
+        );
+        // Attributes, underline shape, then a default colour byte each.
+        hostile.extend_from_slice(&[0, 0, 0, 0, 0]);
+        assert!(matches!(
+            decode_row_frame(&mut Cursor::new(&hostile), 1024),
             Err(DecodeError::InvalidField)
         ));
     }

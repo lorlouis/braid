@@ -4,7 +4,9 @@
 
 use crate::dgram::DatagramSink;
 use crate::journal::{CommandJournal, Deferred, JournalError};
-use crate::state::{ReconnectState, load_sessions, save_sessions, sweep_staging};
+use crate::state::{
+    ReconnectState, load_sessions, private_state_dir, save_sessions, sweep_staging,
+};
 use crate::transport::Outbox;
 use crate::{ClientError, JOURNAL_CAPACITY, MAX_PENDING_INPUT};
 use braid_proto::{
@@ -14,7 +16,7 @@ use braid_proto::{
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// A stream is already ordered and already retransmits; a datagram is neither.
@@ -112,6 +114,10 @@ impl FrameSink for Link {
 /// through a disconnect exhaust the journal and lose a recoverable session.
 pub(crate) struct ClientWriter<W> {
     pub(crate) state: Mutex<Outbound<W>>,
+    /// Notified where the journal stops being empty and where the link epoch
+    /// moves, so the resend thread parks rather than waking on a timer over a
+    /// journal with nothing in it.
+    resend_wake: Arc<Condvar>,
     pub(crate) close_requested: AtomicBool,
     /// The status line is the only report that a keystroke was thrown away.
     pub(crate) dropped_input: AtomicBool,
@@ -134,11 +140,16 @@ pub(crate) struct Outbound<W> {
     pub(crate) deferred: Deferred,
     pub(crate) resend: Resend,
     /// Refilled rather than reallocated: a single typed byte would otherwise
-    /// cost a heap allocation.
-    pub(crate) spare: Vec<u8>,
+    /// cost a heap allocation. A pool rather than one slot, because a round
+    /// trip longer than the gap between keystrokes retires several buffers
+    /// before any of them is wanted again and a slot keeps only the last.
+    pub(crate) spare: Vec<Vec<u8>>,
     /// The journal holds messages rather than frames, so a reconnect
     /// re-encodes at the new link's version.
     pub(crate) version: Version,
+    /// `ClientWriter::resend_wake`, reachable from under the lock the wake
+    /// belongs under: the one place a journal stops being empty is here.
+    wake: Arc<Condvar>,
 }
 
 /// Nothing here runs on a stream: a client retransmitting behind TCP is waste.
@@ -174,12 +185,44 @@ pub(crate) const INITIAL_RESEND: Duration = Duration::from_millis(250);
 
 /// The floor stops a microsecond-latency link from multiplying keystrokes; the
 /// ceiling stops a dead link from outwaiting the read deadline.
-pub(crate) const MIN_RESEND: Duration = Duration::from_millis(50);
+const MIN_RESEND: Duration = Duration::from_millis(50);
 const MAX_RESEND: Duration = Duration::from_secs(2);
 
 /// The front is what unblocks a cumulative ack; the bound stops a stalled link
 /// re-sending a full journal every interval.
 const RESEND_BATCH: usize = 4;
+
+/// Input buffers kept back for the next keystroke. Small on purpose: what is
+/// retired at once is what one round trip held, and a buffer kept is resident.
+const SPARE_INPUT: usize = 4;
+
+/// The largest one kept. A keystroke-path `Input` carries at most
+/// [`MIN_DATAGRAM_FRAME`] less [`INPUT_OVERHEAD`], 1143 bytes, so a buffer
+/// grown past that came from a paste: without the bound four slots of a 64 KiB
+/// paste idle a quarter megabyte for the life of the session.
+const SPARE_INPUT_BYTES: usize = MIN_DATAGRAM_FRAME - INPUT_OVERHEAD;
+
+/// Keep a retired input buffer for the next keystroke. Uncleared: the take
+/// side clears whether it popped a spare or defaulted, so clearing here would
+/// be the second of two.
+fn recycle(spare: &mut Vec<Vec<u8>>, buffer: Vec<u8>) {
+    if spare.len() < SPARE_INPUT && buffer.capacity() <= SPARE_INPUT_BYTES {
+        spare.push(buffer);
+    }
+}
+
+/// What the resend thread is to do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Resending {
+    /// Nothing is outstanding, so nothing is due: park until something is
+    /// journalled. A deadline here woke an idle client twenty times a second
+    /// for the life of the session, each time taking the keystroke lock.
+    Idle,
+    /// The front is owed another copy no later than this.
+    Due(Duration),
+    /// This link retransmits for itself, or a later one has replaced it.
+    Done,
+}
 
 impl Resend {
     /// Two round trips, doubling for every resend nothing answered.
@@ -302,8 +345,14 @@ impl<W: FrameSink> Outbound<W> {
         };
         // A number given to a message that is not retained is a gap the
         // server's gate drops the attachment for.
+        let was_empty = self.journal.is_empty();
         if self.journal.push(sequence, message).is_err() {
             return None;
+        }
+        // The one place a journal stops being empty, and so the one place the
+        // parked resend thread has a deadline to be woken for.
+        if was_empty {
+            self.wake.notify_all();
         }
         self.next_seq = sequence.next();
         let Some(output) = self.output.as_ref() else {
@@ -371,7 +420,7 @@ impl<W: FrameSink> Outbound<W> {
         let mut last = None;
         while sent < self.pending.len() {
             let end = (sent + chunk).min(self.pending.len());
-            let mut bytes = std::mem::take(&mut self.spare);
+            let mut bytes = self.spare.pop().unwrap_or_default();
             bytes.clear();
             bytes.extend_from_slice(&self.pending[sent..end]);
             let Ok(sequence) = self.send(|seq| ClientMessage::Input { seq, bytes }) else {
@@ -399,6 +448,7 @@ pub(crate) enum Accepted {
 
 impl<W: FrameSink> ClientWriter<W> {
     pub(crate) fn new(output: W, first_seq: CmdSeq, version: Version) -> Self {
+        let resend_wake = Arc::new(Condvar::new());
         Self {
             state: Mutex::new(Outbound {
                 output: Some(output),
@@ -409,7 +459,9 @@ impl<W: FrameSink> ClientWriter<W> {
                 deferred: Deferred::default(),
                 resend: Resend::default(),
                 spare: Vec::new(),
+                wake: Arc::clone(&resend_wake),
             }),
+            resend_wake,
             close_requested: AtomicBool::new(false),
             dropped_input: AtomicBool::new(false),
             repaint_outstanding: AtomicBool::new(false),
@@ -461,6 +513,9 @@ impl<W: FrameSink> ClientWriter<W> {
         let mut state = self.lock()?;
         state.output = None;
         self.link_epoch.fetch_add(1, Ordering::Release);
+        // An epoch that moved retires the resend thread, and one parked over an
+        // empty journal has nothing else that would ever wake it.
+        self.resend_wake.notify_all();
         Ok(())
     }
 
@@ -484,6 +539,7 @@ impl<W: FrameSink> ClientWriter<W> {
         }
         let _ = self.drain(&mut state);
         self.link_epoch.fetch_add(1, Ordering::Release);
+        self.resend_wake.notify_all();
         Ok(())
     }
 
@@ -501,29 +557,56 @@ impl<W: FrameSink> ClientWriter<W> {
         state.resend = Resend::default();
         self.dropped_input.store(false, Ordering::Release);
         self.link_epoch.fetch_add(1, Ordering::Release);
+        self.resend_wake.notify_all();
         Ok(())
     }
 
-    /// Put the oldest unacknowledged commands back on the wire, and report
-    /// when to look again. `None` is a caller with nothing left to do: a
-    /// stream, or a link replaced since the caller was spawned for it.
-    pub(crate) fn retransmit(
-        &self,
-        now: Instant,
-        epoch: u64,
-    ) -> Result<Option<Duration>, ClientError> {
+    /// Put the oldest unacknowledged commands back on the wire, and report what
+    /// the caller is to do next. [`Resending::Done`] is a caller with nothing
+    /// left to do: a stream, or a link replaced since it was spawned for it.
+    pub(crate) fn retransmit(&self, now: Instant, epoch: u64) -> Result<Resending, ClientError> {
         let mut state = self.lock()?;
         if self.epoch() != epoch || state.carriage() != Some(Carriage::Datagram) {
-            return Ok(None);
+            return Ok(Resending::Done);
         }
         if state.journal.is_empty() {
             state.resend.waiting = None;
-            return Ok(Some(state.resend.interval()));
+            return Ok(Resending::Idle);
         }
         if state.resend.due(now) {
             state.resend_front();
         }
-        Ok(Some(state.resend.remaining(now)))
+        Ok(Resending::Due(state.resend.remaining(now)))
+    }
+
+    /// Park the resend thread on what [`Self::retransmit`] just decided, and
+    /// report whether there is a next round. [`Resending::Done`] is the thread
+    /// retiring: it never waits.
+    ///
+    /// The [`Resending::Idle`] park is indefinite, so its predicate is
+    /// re-checked under the lock the notifier holds: a message journalled
+    /// between [`Self::retransmit`] and this call notified a thread not yet
+    /// waiting, and would then be held until something else happened to the
+    /// session.
+    pub(crate) fn park(&self, epoch: u64, next: Resending) -> bool {
+        let (Resending::Due(_) | Resending::Idle) = next else {
+            return false;
+        };
+        let Ok(state) = self.state.lock() else {
+            return true;
+        };
+        // Dropped rather than bound: the two waits answer with different
+        // poison types, and the guard is wanted for neither.
+        match next {
+            Resending::Due(wait) => {
+                drop(self.resend_wake.wait_timeout(state, wait.max(MIN_RESEND)));
+            }
+            Resending::Idle if self.epoch() == epoch && state.journal.is_empty() => {
+                drop(self.resend_wake.wait(state));
+            }
+            _ => {}
+        }
+        true
     }
 
     pub(crate) fn request_repaint(&self) -> Result<(), ClientError> {
@@ -655,7 +738,7 @@ impl<W: FrameSink> ClientWriter<W> {
     pub(crate) fn acknowledge(&self, highest: CmdSeq) -> Result<(), ClientError> {
         let mut state = self.lock()?;
         if let Some(spare) = state.journal.acknowledge(highest) {
-            state.spare = spare;
+            recycle(&mut state.spare, spare);
         }
         if state.carriage() == Some(Carriage::Datagram) {
             // Bound rather than left as a scrutinee: the borrow of `resend`
@@ -704,6 +787,14 @@ impl Checkpoint {
     const INTERVAL: Duration = Duration::from_millis(250);
 
     pub(crate) fn new(path: Option<PathBuf>) -> Self {
+        // Proved owned and 0700 before anything is read out of this tree, not
+        // only before the next write: the directory is *repaired* rather than
+        // refused for pre-v7 compatibility, so a permissive one is expected in
+        // the field, and both the sweep below and the later load run inside it.
+        let path = path.filter(|path| {
+            path.parent()
+                .is_some_and(|parent| private_state_dir(parent).is_ok())
+        });
         if let Some(path) = path.as_deref() {
             sweep_staging(path);
         }

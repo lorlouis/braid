@@ -431,8 +431,12 @@ impl Endpoint {
     /// persistent-congestion rule all read it, and two copies would disagree.
     fn absorb(&mut self, now: Instant) {
         for arrived in self.loss.arrived() {
-            self.congestion
-                .acknowledged(arrived.bytes, arrived.sent, self.loss.rtt());
+            self.congestion.acknowledged(
+                arrived.bytes,
+                arrived.sent,
+                self.loss.rtt(),
+                arrived.limited,
+            );
             self.mtu.acknowledged(arrived.number, arrived.bytes);
         }
         for gone in self.loss.gone() {
@@ -441,11 +445,15 @@ impl Endpoint {
                     self.congestion.lost(gone.bytes, gone.sent, now);
                     self.mtu.lost(gone.number, gone.bytes, now);
                 }
-                // Silence moves neither: a packet nobody mentioned is neither
-                // a full queue nor a narrow path.
-                Cause::Abandoned => {
+                // The window does not move on either: a packet nobody mentioned
+                // is not a full queue, and one the table forgot is not a fact.
+                Cause::Silent => {
                     self.congestion.abandoned(gone.bytes);
-                    self.mtu.abandoned(gone.number, now);
+                    self.mtu.silent(gone.number, gone.bytes, now);
+                }
+                Cause::Overflowed => {
+                    self.congestion.abandoned(gone.bytes);
+                    self.mtu.forgotten(gone.number, now);
                 }
             }
         }
@@ -576,11 +584,12 @@ impl Endpoint {
         self.next += 1;
         self.sealed_since_poll = true;
         if tracked(kind) {
-            self.congestion.sealed(bytes, now);
+            let limited = self.congestion.sealed(bytes, now);
             self.loss.sealed(InFlight {
                 number: header.number,
                 bytes,
                 sent: now,
+                limited,
             });
             // `sealed` can retire the oldest of an unbounded flight, and what
             // it retires still has to reach the controller.
@@ -655,8 +664,13 @@ impl Endpoint {
                         // Exhaustion is no reason to refuse the move: the old
                         // keys are still sound, there are just no fresher ones.
                         let _ = self.rotate();
-                        // RFC 9002 §5.5: what was measured describes the path
-                        // it was measured on.
+                        // RFC 9002 §5.5 and RFC 8899 §5.4: what was measured
+                        // describes the path it was measured on, and a width is
+                        // a measurement. The order is what keeps the window
+                        // honest, since it reopens at ten of whatever a datagram
+                        // is: off a jumbo path that is ten times 8900.
+                        self.mtu.migrated();
+                        self.congestion.datagram(self.mtu.datagram());
                         self.congestion.migrated();
                         self.loss.migrated();
                         Ok(Received::Migrated(moved))
@@ -1286,9 +1300,16 @@ mod tests {
         let (mut client, mut server, _, now) = pair();
         let fresh = connect(8).stats().cwnd;
 
-        let mut wire = Vec::new();
-        server.send(b"a screen", now, &mut wire).unwrap();
-        client.recv(addr(1), now, &mut wire).unwrap();
+        // Filled rather than trickled into: RFC 9002 §7.8 grows nothing for a
+        // sender the window never held back, so there would be nothing to reset.
+        let screen = vec![7u8; server.payload_limit()];
+        while server.writable(now, screen.len()) {
+            let mut wire = Vec::new();
+            if server.send(&screen, now, &mut wire).is_err() {
+                break;
+            }
+            client.recv(addr(1), now, &mut wire).unwrap();
+        }
         let later = now + Duration::from_millis(50);
         let mut ack = Vec::new();
         client.poll_transmit(now, &mut ack).unwrap();
@@ -1302,6 +1323,46 @@ mod tests {
         assert_eq!(server.stats().cwnd, fresh, "and it starts again");
     }
 
+    /// A width is a measurement of the path it was taken on, and the window is
+    /// denominated in whatever a datagram is: carried across a migration, the
+    /// new path opens at ten jumbo datagrams, seven times RFC 9002 §7.2's cap.
+    #[test]
+    fn a_migration_puts_the_path_back_on_the_base_datagram() {
+        let (mut client, mut server, _, mut now) = pair();
+        let base = BASE_DATAGRAM - HEADER_BYTES - TAG_BYTES;
+        let fresh = connect(8).stats().cwnd;
+
+        // The server is the side that migrates, and only its own frames earn it
+        // the acknowledgements a search is allowed to spend a probe on.
+        for _ in 0..8 {
+            now += Duration::from_millis(30);
+            let mut wire = Vec::new();
+            server.send(b"a screen", now, &mut wire).unwrap();
+            client.recv(addr(1), now, &mut wire).unwrap();
+            exchange(&mut server, &mut client, addr(1), now);
+            now += Duration::from_millis(30);
+            exchange(&mut client, &mut server, addr(2), now);
+        }
+        assert!(
+            server.payload_limit() > base,
+            "the search never left the base size: {:?}",
+            server.stats()
+        );
+
+        migrate(&mut client, &mut server, addr(3), now);
+
+        assert_eq!(
+            server.payload_limit(),
+            base,
+            "and this path has proved none"
+        );
+        assert_eq!(
+            server.stats().cwnd,
+            fresh,
+            "the window reopens at ten of the base datagram, not ten jumbo ones"
+        );
+    }
+
     /// Abandoning the oldest to make room moves neither the window nor the
     /// search, so loss detection would go blind instead of the sender waiting.
     #[test]
@@ -1310,24 +1371,55 @@ mod tests {
         let datagram = 1 + HEADER_BYTES + TAG_BYTES;
         let wanted = (crate::loss::MAX_TRACKED + 32) * datagram;
 
-        // Two at a time so the ack is due at once, a moment apart for the pacer.
-        while client.stats().cwnd < wanted {
-            now += Duration::from_micros(1);
-            for byte in 0..2u8 {
+        // RFC 9002 §7.8 grows the window only for a sender the window is what
+        // stopped, so a trickle earns nothing to overflow the table with. Full
+        // datagrams keep the flight shallower than an acknowledgement's
+        // sixty-four bits, which a deeper one would read as loss.
+        for _ in 0..8 {
+            now += Duration::from_millis(30);
+            exchange(&mut client, &mut server, addr(2), now);
+            now += Duration::from_millis(30);
+            exchange(&mut server, &mut client, addr(1), now);
+        }
+        let full = vec![0u8; client.payload_limit()];
+        let width = full.len() + HEADER_BYTES + TAG_BYTES;
+        assert!(
+            wanted < 60 * width,
+            "the search never widened the path: {:?}",
+            client.stats()
+        );
+
+        for _ in 0..64 {
+            if client.stats().cwnd >= wanted {
+                break;
+            }
+            while let Some(at) = client.ready(now, full.len()) {
+                now = now.max(at);
                 let mut wire = Vec::new();
-                client.send(&[byte], now, &mut wire).unwrap();
+                if client.send(&full, now, &mut wire).is_err() {
+                    break;
+                }
                 server.recv(addr(2), now, &mut wire).unwrap();
             }
-            let mut ack = Vec::new();
-            server.poll_transmit(now, &mut ack).expect("an ack is due");
-            client.recv(addr(1), now, &mut ack).unwrap();
+            now += Duration::from_millis(30);
+            exchange(&mut server, &mut client, addr(1), now);
         }
+        let stats = client.stats();
+        assert!(stats.cwnd >= wanted, "the window never filled: {stats:?}");
+        assert_eq!(
+            stats.bytes_in_flight, 0,
+            "and the flight drained: {stats:?}"
+        );
 
         let mut sealed = 0usize;
         let ceiling = 2 * crate::loss::MAX_TRACKED;
         // Bounded: a table that abandoned its oldest would never refuse.
         while sealed < ceiling {
-            now += Duration::from_micros(1);
+            // Through the pacer, so what refuses is the window or the table.
+            let Some(at) = client.ready(now, 1) else {
+                break;
+            };
+            now = now.max(at);
             if client.send(&[0], now, &mut Vec::new()).is_err() {
                 break;
             }

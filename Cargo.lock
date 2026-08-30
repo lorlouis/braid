@@ -82,6 +82,7 @@ dependencies = [
  "braid-proto",
  "braid-vt",
  "getrandom",
+ "libc",
  "rustix",
  "signal-hook",
  "thiserror 2.0.20",

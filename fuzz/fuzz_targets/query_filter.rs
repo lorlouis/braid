@@ -59,7 +59,10 @@ fuzz_target!(|data: &[u8]| {
         // The emulator's screen is what the server paints from, so a byte lost
         // or duplicated here is a client painting from a terminal that never
         // saw its own output.
-        assert_eq!(seen, data, "the emulator was not handed the input: {answer:?}");
+        assert_eq!(
+            seen, data,
+            "the emulator was not handed the input: {answer:?}"
+        );
         assert!(
             is_subsequence(&sent, data),
             "the client was sent bytes the application never wrote: {answer:?}"

@@ -40,6 +40,13 @@ codegen-units = 1
 overflow-checks = true
 # Not `panic = "abort"`: one session's panic must not take the daemon down.
 
+# Workspace crates stay unoptimised so a backtrace still names a line, but the suite
+# spends most of its time inside three dependencies — every AEAD seal, every capability
+# hash and every screen deflate — and those are an order of magnitude slower at
+# `opt-level = 0`. Nothing here reaches a shipped binary.
+[profile.dev.package."*"]
+opt-level = 2
+
 [package]
 name = "braid"
 version = "0.1.0"

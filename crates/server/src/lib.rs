@@ -491,13 +491,13 @@ fn sweep_tickets(directory: &std::path::Path) {
 /// The exclusive right to serve the daemon socket, held for the process's
 /// life: two `brd` invocations from a cold start both spawn a daemon, and a
 /// loser that unlinked and rebound would be live but unreachable forever.
-struct DaemonLock {
+pub(crate) struct DaemonLock {
     /// The open descriptor is the lock; closing it releases it.
     _file: File,
 }
 
 impl DaemonLock {
-    fn acquire() -> Result<Option<Self>, ServerError> {
+    pub(crate) fn acquire() -> Result<Option<Self>, ServerError> {
         let file = fs::OpenOptions::new()
             .create(true)
             .write(true)

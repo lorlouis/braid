@@ -247,11 +247,33 @@ fn deferred_command(body: &str) -> Option<DeferredKind> {
         // 0/1/2 window and icon title, 7 the working directory a terminal
         // tracks for new tabs.
         0 | 1 | 2 | 7 => Some(DeferredKind::Sticky(number)),
-        // 8 hyperlink (an open/close pair), 9 and 777 notifications, 52 the
-        // clipboard, 133 shell prompt marks.
-        8 | 9 | 52 | 133 | 777 => Some(DeferredKind::Event),
+        // 8 hyperlink (an open/close pair), 9 and 777 notifications, 133 shell
+        // prompt marks.
+        8 | 9 | 133 | 777 => Some(DeferredKind::Event),
+        52 => clipboard_write(body),
         _ => None,
     }
+}
+
+/// `OSC 52` writes the clipboard and reads it back under one number, and only
+/// the payload tells them apart: `?` asks.
+///
+/// The emulator answers no clipboard query - `crates/vt` leaves `CLIPBOARD` out
+/// of its device attributes because there is no read path back - so
+/// `QueryFilter` forwards one to the client by design, and live that is what
+/// plain `ssh` does too. Replaying it is not: a fresh attachment starts at
+/// `DeferMark(0)` and is owed the whole log, so a read recorded here is put to
+/// a terminal that was never there, on another machine, minutes late. A read
+/// carries no state a later client needs restated, so dropping it costs
+/// nothing.
+fn clipboard_write(body: &str) -> Option<DeferredKind> {
+    // A malformed body is dropped rather than deferred: base64 holds no `;`, so
+    // anything short of selection and payload is not a clipboard write.
+    let data = body.splitn(3, ';').nth(2)?;
+    if data == "?" {
+        return None;
+    }
+    Some(DeferredKind::Event)
 }
 
 #[cfg(test)]
@@ -295,6 +317,24 @@ mod tests {
             carried[1],
             format!("2;working {}", DEFERRED_ENTRIES * 4 - 1)
         );
+    }
+
+    /// A clipboard read and a clipboard write share `OSC 52`, and only the
+    /// write is state. The read is a question: restated behind a mark, it
+    /// reaches a terminal that never asked it, minutes after the application
+    /// that did stopped listening.
+    #[test]
+    fn a_clipboard_read_is_never_carried_but_a_write_still_is() {
+        let mut log = DeferredOsc::new();
+        let start = log.mark();
+        log.feed(b"\x1b]52;c;?\x07");
+        log.feed(b"\x1b]52;p;?\x1b\\");
+        // Neither half of a write is a question.
+        log.feed(b"\x1b]52;c;aGVsbG8=\x07");
+        // Malformed: dropped rather than deferred.
+        log.feed(b"\x1b]52\x07");
+        log.feed(b"\x1b]52;c\x07");
+        assert_eq!(log.since(start), vec!["52;c;aGVsbG8=".to_owned()]);
     }
 
     /// What the skipping scanner records must be byte for byte what stepping

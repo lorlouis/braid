@@ -209,8 +209,8 @@ fn serve(
     // Otherwise a frame per forwarded chunk costs a fresh zeroed allocation.
     let mut payload = Vec::new();
     loop {
-        match next_forward_frame(&mut session.inbound, &mut payload) {
-            Ok(()) => {}
+        let frame = match next_forward_frame(&mut session.inbound, &mut payload) {
+            Ok(frame) => frame,
             Err(error) if error.is_transport_loss() => {
                 // Being asked to stop is not a failure, whatever became of the
                 // transport.
@@ -251,8 +251,8 @@ fn serve(
                 continue;
             }
             Err(error) => return Err(ClientError::Protocol(error)),
-        }
-        match ServerMessage::decode(&payload, session.version)? {
+        };
+        match ServerMessage::decode(frame, session.version)? {
             ServerMessage::Ping {
                 token, interval_ms, ..
             } => {

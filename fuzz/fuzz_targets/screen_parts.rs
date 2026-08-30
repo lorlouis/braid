@@ -63,7 +63,7 @@ fn row(input: &mut Input<'_>, cols: u16) -> RowFrame {
     // A styled row is the one with a boundary to cut at.
     if input.flag() {
         let clusters_per_run = u16::try_from(MAX_RUN_BYTES / bytes).expect("clusters a run covers");
-        // A run costs twenty bytes against the one its cell text costs, so a
+        // A run costs eighteen bytes against the one its cell text costs, so a
         // per-cell colouring is the row that does not fit a datagram.
         let per_run = if input.flag() {
             width

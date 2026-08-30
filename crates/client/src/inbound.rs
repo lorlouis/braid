@@ -250,23 +250,28 @@ impl Inbound {
     /// shown, and must not pay a write for a frame already in hand - which an
     /// unconditional flush does, seventeen times for a repaint's seventeen
     /// datagrams. Only the reader about to wait can tell those apart.
-    fn read_frame_into(
-        &mut self,
-        payload: &mut Vec<u8>,
+    ///
+    /// Borrowed rather than copied into `scratch`: a datagram carrying a stored
+    /// payload is already contiguous in the reader's own buffer, so an owning
+    /// shape forces a `MAX_OUTPUT_CHUNK` copy per frame for nothing.
+    fn read_frame<'a>(
+        &'a mut self,
+        scratch: &'a mut Vec<u8>,
         park: &mut dyn FnMut(),
-    ) -> Result<(), braid_proto::DecodeError> {
+    ) -> Result<&'a [u8], braid_proto::DecodeError> {
         match self {
             // A whole frame in the buffer never touches the descriptor.
             Self::Ssh(stream) => {
                 if !whole_frame(stream.buffer()) {
                     park();
                 }
-                read_frame_into(stream, payload, MAX_FRAME)
+                read_frame_into(stream, &mut *scratch, MAX_FRAME)?;
+                Ok(scratch)
             }
             // A readable socket is not a frame in hand: this reader drops
             // acknowledgements and keep-alives without handing anything up, so
             // it is the one that knows when it is about to wait.
-            Self::Datagram(reader) => reader.read_frame_into(payload, park),
+            Self::Datagram(reader) => reader.read_frame(scratch, park),
         }
     }
 }
@@ -285,12 +290,12 @@ fn whole_frame(buffered: &[u8]) -> bool {
 /// of its own to carry, and a terminal that will not take bytes ends the
 /// session at the next write. Unconditional because an empty
 /// [`io::BufWriter`] issues no syscall.
-pub(crate) fn next_frame<W: Write>(
-    inbound: &mut Inbound,
-    payload: &mut Vec<u8>,
+pub(crate) fn next_frame<'a, W: Write>(
+    inbound: &'a mut Inbound,
+    scratch: &'a mut Vec<u8>,
     display: &Shared<W>,
-) -> Result<(), braid_proto::DecodeError> {
-    inbound.read_frame_into(payload, &mut || {
+) -> Result<&'a [u8], braid_proto::DecodeError> {
+    inbound.read_frame(scratch, &mut || {
         if let Ok(mut display) = display.lock() {
             let _ = display.flush();
         }
@@ -299,11 +304,11 @@ pub(crate) fn next_frame<W: Write>(
 
 /// The next frame for a client with no terminal under it: a forward-only
 /// client holds nothing on its way to a screen, so there is nothing to flush.
-pub(crate) fn next_forward_frame(
-    inbound: &mut Inbound,
-    payload: &mut Vec<u8>,
-) -> Result<(), braid_proto::DecodeError> {
-    inbound.read_frame_into(payload, &mut || {})
+pub(crate) fn next_forward_frame<'a>(
+    inbound: &'a mut Inbound,
+    scratch: &'a mut Vec<u8>,
+) -> Result<&'a [u8], braid_proto::DecodeError> {
+    inbound.read_frame(scratch, &mut || {})
 }
 
 /// Three tries under a second: enough to survive the first `Resume` being
@@ -346,12 +351,12 @@ pub(crate) fn take_offer(
         if !sink.send(resume.clone()) {
             break;
         }
-        if reader.read_frame_into(&mut payload, &mut || {}).is_err() {
+        let Ok(frame) = reader.read_frame(&mut payload, &mut || {}) else {
             continue;
-        }
+        };
         // Either establishment message, because the one that arrives names the
         // session's kind: a forward-only session has no grid to state.
-        answered = match ServerMessage::decode(&payload, Version::LOCAL) {
+        answered = match ServerMessage::decode(frame, Version::LOCAL) {
             Ok(
                 ServerMessage::Hello { version, .. } | ServerMessage::HelloForward { version, .. },
             ) => Some(version),

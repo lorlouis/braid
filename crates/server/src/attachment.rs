@@ -18,7 +18,7 @@ use braid_proto::wire::pack_from;
 use braid_proto::{
     ByteOff, ClientId, CmdSeq, EncodeError, Generation, GridSize, InputCue, MAX_FRAME,
     MAX_OUTPUT_CHUNK, RowUpdate, ScreenHeader, ScreenVersion, encode_output_into,
-    encode_screen_parts,
+    encode_screen_parts_into,
 };
 use braid_vt::RepaintFrame;
 use std::collections::VecDeque;
@@ -250,9 +250,10 @@ pub(crate) struct Attachment {
     encode_failures: u32,
     /// The last screen handed to the sink was larger than one client should hold.
     pub(crate) pressure: sink::ScreenPressure,
-    /// Frame buffers the transport has finished with, so the allocator does
-    /// not see this client's whole byte stream twice.
-    pub(crate) spare: Vec<Vec<u8>>,
+    /// The buffers the transport has finished with, so the allocator does not
+    /// see this client's whole byte stream - or every screen it is cut into -
+    /// twice.
+    pools: Pools,
     pub(crate) packing: Packing,
     /// What this attachment's ceilings cost the daemon, given back on drop.
     _charge: AttachmentSlot,
@@ -289,7 +290,7 @@ impl Attachment {
             deferred_sent: DeferMark(0),
             encode_failures: 0,
             pressure: sink::ScreenPressure::Clear,
-            spare: Vec::new(),
+            pools: Pools::new(),
             packing,
             _charge: charge,
         }
@@ -496,6 +497,11 @@ impl Attachment {
         now: Instant,
         mark: DeferMark,
     ) -> Result<(), SinkError> {
+        // Output is traffic: the probe interval is paced by the link again from
+        // here, having backed off while there was nothing to pace.
+        if !bytes.is_empty() {
+            self.link.stirred();
+        }
         // Further behind than a stream's window would have let it get. Treated
         // exactly like a full queue, because it is that fact by another route.
         if matches!(self.framing, Framing::Datagram { .. })
@@ -510,7 +516,7 @@ impl Attachment {
         let chunk_budget = self.framing.output_chunk();
         let mut start = 0;
         // One reclaim per read: the transport retires a whole batch at a time.
-        self.sink.reclaim(&mut self.spare);
+        self.pools.reclaim_frames(&self.sink);
         while start < bytes.len() {
             let end = (start + chunk_budget).min(bytes.len());
             // Only the last chunk leaves the emulator where the cue says it
@@ -520,7 +526,7 @@ impl Attachment {
             } else {
                 InputCue::Opaque
             };
-            let mut frame = self.spare.pop().unwrap_or_default();
+            let mut frame = self.pools.frame();
             encode_output_into(&mut frame, offset, chunk, echo_ack, &bytes[start..end])
                 .map_err(|_| SinkError::Unusable)?;
             match self.sink.send_output(frame) {
@@ -557,17 +563,21 @@ impl Attachment {
         // Read here rather than held on the attachment: a path that just
         // raised its MTU should cut this screen to the larger bound.
         let budget = self.framing.screen_budget();
+        // One reclaim per screen, as the output path takes one per PTY read -
+        // and the only one a client in a sync episode gets, that path being the
+        // one it has stopped reaching.
+        self.pools.reclaim(&self.sink);
         let encoded = {
-            // Destructured so the ledger's borrow and the frame pool's are
-            // disjoint from the packing state's.
+            // Destructured so the ledger's borrow and the pools' are disjoint
+            // from the packing state's.
             let Self {
                 ledger,
                 packing,
-                spare,
+                pools,
                 ..
             } = self;
             let plan = ledger.plan(frame, header);
-            screen_pieces(budget, packing, header, plan, frame, fits, spare)
+            screen_pieces(budget, packing, header, plan, frame, fits, pools)
         };
         let Ok(encoded) = encoded else {
             // Not a `Reject`, which is terminal and would end a session whose
@@ -722,6 +732,79 @@ impl Packed {
     }
 }
 
+/// The buffers one attachment encodes into, in the two size classes
+/// [`sink::keep`] sorts the transport's own pool by.
+pub(crate) struct Pools {
+    /// Output frames and a datagram's screen pieces, which are an MTU each.
+    frames: Vec<Vec<u8>>,
+    /// Pieces past [`MAX_OUTPUT_CHUNK`]: a stream framing's whole screen, on a
+    /// grid large enough to build one that size.
+    screens: Vec<Vec<u8>>,
+    /// The pieces of the cut in progress. Kept between screens on a datagram
+    /// path, where what leaves is the packing's own copy of them; a stream's
+    /// cut is handed to the sink as it stands, and this starts the next screen
+    /// empty.
+    parts: Vec<Vec<u8>>,
+}
+
+impl Pools {
+    pub(crate) const fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+            screens: Vec::new(),
+            parts: Vec::new(),
+        }
+    }
+
+    /// Take back the frame buffers the transport has finished with.
+    fn reclaim_frames(&mut self, sink: &AttachmentSink) {
+        sink.reclaim(&mut self.frames);
+    }
+
+    /// The same in both classes, for the repaint path: a client in a sync
+    /// episode never reaches the output path, and cutting sixty screens a
+    /// second out of a pool nothing refills is the allocation the pool exists
+    /// to remove.
+    fn reclaim(&mut self, sink: &AttachmentSink) {
+        self.reclaim_frames(sink);
+        sink.reclaim_screens(&mut self.screens);
+    }
+
+    /// One buffer for a frame of byte-stream output.
+    fn frame(&mut self) -> Vec<u8> {
+        self.frames.pop().unwrap_or_default()
+    }
+
+    /// The pieces of a cut and the pool they are drawn from, borrowed together
+    /// because the encoder fills the one out of the other. Chosen by the
+    /// budget, which is what bounds a piece - and by what the screen pool
+    /// holds, because a grid whose whole screen still fits a frame is retired
+    /// into the frame pool and has to be cut from it.
+    fn cutting(&mut self, budget: usize) -> (&mut Vec<Vec<u8>>, &mut Vec<Vec<u8>>) {
+        let spare = if budget > MAX_OUTPUT_CHUNK && !self.screens.is_empty() {
+            &mut self.screens
+        } else {
+            &mut self.frames
+        };
+        (&mut self.parts, spare)
+    }
+
+    /// Return what an abandoned attempt built, before the next one draws from
+    /// the pool: the encoder clears `parts`, which would free them where they
+    /// lie.
+    fn recycle_parts(&mut self) {
+        for piece in self.parts.drain(..) {
+            sink::keep(&mut self.frames, &mut self.screens, piece);
+        }
+    }
+
+    /// The finished cut, for the sink to carry. The vector goes with it: the
+    /// pieces are the transport's until it has written them.
+    fn take_parts(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.parts)
+    }
+}
+
 /// Repaints that may fail to encode before the clock stops driving them.
 const ENCODE_ATTEMPTS: u32 = 2;
 
@@ -737,14 +820,15 @@ fn screen_pieces(
     plan: &screen::Plan,
     frame: &RepaintFrame,
     fits: bool,
-    spare: &mut Vec<Vec<u8>>,
+    pools: &mut Pools,
 ) -> Result<Cut, EncodeError> {
     // A delta's scroll only moves the rows it names when the grid is the whole
     // terminal; a taller client refuses it and asks for a screen anyway.
     let whole = plan.full || (plan.scroll.is_some() && !fits);
     let Packing::Packed(packed) = packing else {
+        attempt(header, plan, frame, whole, budget, pools)?;
         return Ok(Cut {
-            pieces: attempt(header, plan, frame, whole, budget)?,
+            pieces: pools.take_parts(),
             coding: Coding::Raw,
         });
     };
@@ -754,54 +838,56 @@ fn screen_pieces(
     let mut planned = limit.saturating_mul(packed.ratio) / RATIO_ONE;
     loop {
         planned = planned.max(budget);
-        let pieces = attempt(header, plan, frame, whole, planned)?;
-        if pieces.is_empty() {
+        attempt(header, plan, frame, whole, planned, pools)?;
+        if pools.parts.is_empty() {
             return Ok(Cut {
-                pieces,
+                pieces: Vec::new(),
                 coding: Coding::Raw,
             });
         }
-        let (measured, carried) = packed.measure(&pieces, limit, spare);
+        let (measured, carried) = packed.measure(&pools.parts, limit, &mut pools.frames);
         packed.observed(measured);
+        // The raw cut has served its purpose; its buffers go back to the pool
+        // the packed ones were drawn from.
+        pools.recycle_parts();
         // At the raw bound nothing smaller is available or needed: `pack`
         // never returns more than its input plus a tag.
         if carried || planned <= budget {
-            // The raw cut has served its purpose; its buffers go back to the
-            // pool the packed ones were drawn from.
-            recycle(pieces, spare);
             return Ok(Cut {
                 pieces: packed.take_carried(),
                 coding: Coding::Packed,
             });
         }
-        recycle(pieces, spare);
         planned /= 2;
     }
 }
 
-/// Return frame buffers to the attachment's pool, under the bound the sink
-/// keeps its own by.
-fn recycle(pieces: Vec<Vec<u8>>, spare: &mut Vec<Vec<u8>>) {
-    for piece in pieces {
-        sink::recycle(spare, piece);
-    }
-}
-
 /// One cut at a given piece budget, dropping what cannot be cut if the exact
-/// attempt will not fit.
+/// attempt will not fit. The pieces are left in the pool's own `parts`, drawn
+/// from the class of buffer the framing recycles through.
 pub(crate) fn attempt(
     header: &ScreenHeader,
     plan: &screen::Plan,
     frame: &RepaintFrame,
     whole: bool,
     budget: usize,
-) -> Result<Vec<Vec<u8>>, EncodeError> {
-    match cut(header, plan, frame, whole, budget, Fidelity::Exact) {
+    pools: &mut Pools,
+) -> Result<(), EncodeError> {
+    let built = match cut(header, plan, frame, whole, budget, Fidelity::Exact, pools) {
         // A span too wide for any piece fails the same way on every repaint,
         // and a row missing its end beats a screen that never arrives.
-        Err(EncodeError::Oversize) => cut(header, plan, frame, whole, budget, Fidelity::Lossy),
+        Err(EncodeError::Oversize) => {
+            pools.recycle_parts();
+            cut(header, plan, frame, whole, budget, Fidelity::Lossy, pools)
+        }
         cut => cut,
+    };
+    if built.is_err() {
+        // Nothing will be sent and the next screen's encode clears `parts`:
+        // what a half-built cut is holding goes back now or not at all.
+        pools.recycle_parts();
     }
+    built
 }
 
 /// Whether a span too wide for any piece may be dropped.
@@ -820,7 +906,9 @@ pub(crate) fn cut(
     whole: bool,
     budget: usize,
     fidelity: Fidelity,
-) -> Result<Vec<Vec<u8>>, EncodeError> {
+    pools: &mut Pools,
+) -> Result<(), EncodeError> {
+    let (parts, spare) = pools.cutting(budget);
     if whole {
         let count = u16::try_from(frame.rows.len()).map_err(|_| EncodeError::Oversize)?;
         let every = (0..count).map(|row| {
@@ -830,18 +918,27 @@ pub(crate) fn cut(
                 budget,
             )
         });
-        return encode_screen_parts(header, None, None, every, budget);
+        return encode_screen_parts_into(header, None, None, every, budget, parts, spare);
     }
     let named = plan.rows.iter().map(|named| {
         let row = &frame.rows[usize::from(named.row)];
         degraded(named.update(row), fidelity, budget)
     });
-    match encode_screen_parts(header, Some(plan.base), plan.scroll, named, budget) {
+    match encode_screen_parts_into(
+        header,
+        Some(plan.base),
+        plan.scroll,
+        named,
+        budget,
+        parts,
+        spare,
+    ) {
         // A scroll survives only in a single piece and carries only the rows
         // it reveals, so one that did not fit is refused rather than dropped:
         // the whole screen is the applicable answer.
         Err(EncodeError::Oversize) if plan.scroll.is_some() => {
-            cut(header, plan, frame, true, budget, fidelity)
+            pools.recycle_parts();
+            cut(header, plan, frame, true, budget, fidelity, pools)
         }
         cut => cut,
     }
@@ -1056,7 +1153,7 @@ mod tests {
         ledger.note_damage(&frame.dirty);
         let header = header_of(Generation::initial(), ScreenVersion::initial(), frame);
         let plan = ledger.plan(frame, &header);
-        let mut spare = Vec::new();
+        let mut pools = Pools::new();
         screen_pieces(
             DATAGRAM_BUDGET,
             packing,
@@ -1064,7 +1161,7 @@ mod tests {
             plan,
             frame,
             true,
-            &mut spare,
+            &mut pools,
         )
         .expect("the screen encodes")
     }
@@ -1665,6 +1762,89 @@ mod tests {
         assert!(
             attachment.owed_deferred(&log).is_empty(),
             "a client that confirmed the screen is still owed what it carried"
+        );
+    }
+
+    /// A datagram cuts one screen into a piece per path MTU, at up to sixty
+    /// screens a second for as long as a sync episode lasts. Warm, every one of
+    /// those pieces is a buffer the transport has already given back.
+    #[test]
+    fn a_warm_attachment_cuts_every_piece_out_of_its_pool() {
+        const KEPT: usize = 32;
+        let (mut attachment, output) = datagram_attachment();
+        // What `reclaim` leaves the pool holding, each sized past any piece
+        // this path carries so a fresh one cannot be mistaken for one of these.
+        attachment.pools.frames = (0..KEPT)
+            .map(|_| Vec::with_capacity(4 * DATAGRAM_BUDGET))
+            .collect();
+
+        repaint(&mut attachment, &wide_frame(GRID, 0)).expect("a screen");
+
+        assert!(
+            attachment
+                .pools
+                .frames
+                .iter()
+                .all(|buffer| buffer.capacity() >= 4 * DATAGRAM_BUDGET),
+            "the cut allocated beside a pool that was holding {KEPT} buffers"
+        );
+        // What the pool gave up is what left with the screen: the raw cut the
+        // packing measured came back before the pieces went out.
+        let taken = KEPT - attachment.pools.frames.len();
+        assert!(
+            taken > 1,
+            "a screen of one piece is not the cut this is about"
+        );
+        assert!(written_frames(&output, taken), "the screen never went out");
+        assert_eq!(
+            screen_parts(&output).len(),
+            taken,
+            "the pieces that went out are not the buffers the pool gave up"
+        );
+    }
+
+    /// A client in a sync episode never reaches the output path, which is where
+    /// the frame pool is refilled from: the repaint path has to take the
+    /// transport's spent buffers back itself, or every screen after the first
+    /// allocates the pieces it is sent in.
+    #[test]
+    fn a_repaint_takes_back_the_buffers_the_transport_finished_with() {
+        let big = 4 * DATAGRAM_BUDGET;
+        let (mut attachment, output) = datagram_attachment();
+
+        // One screen, to learn what this grid cuts into and to take what it
+        // allocated out of the transport's hands.
+        repaint(&mut attachment, &wide_frame(GRID, 0)).expect("a screen");
+        let pieces = attachment.pools.frames.len();
+        let mut cold = Vec::new();
+        assert!(
+            settles(Duration::from_secs(2), || {
+                attachment.sink.reclaim(&mut cold);
+                cold.len() >= pieces
+            }),
+            "the transport never finished with the first screen"
+        );
+        // One screen's worth on either side of the hand-off: the cut in flight
+        // and the cut being built.
+        attachment.pools.frames = (0..2 * pieces).map(|_| Vec::with_capacity(big)).collect();
+
+        for line in 1..5 {
+            repaint(&mut attachment, &wide_frame(GRID, line)).expect("a screen");
+            assert!(
+                settles(Duration::from_secs(2), || attachment.sink.is_drained()),
+                "screen {line} never reached the transport"
+            );
+        }
+
+        let mut left = Vec::new();
+        attachment.sink.reclaim(&mut left);
+        assert!(
+            left.iter().all(|buffer| buffer.capacity() >= big),
+            "the transport is holding buffers a repaint allocated rather than the ones it gave back"
+        );
+        assert!(
+            written_frames(&output, 2 * pieces),
+            "the repaints never went out"
         );
     }
 }

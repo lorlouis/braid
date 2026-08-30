@@ -138,10 +138,42 @@ const fn is_bulk(event: &ActorEvent) -> bool {
     )
 }
 
+/// Which of the two queues an event travels on.
+///
+/// A sender waits for room in its own lane and a dequeue frees exactly one, so
+/// the lane is what says which producers a pop concerns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lane {
+    Control,
+    Output,
+}
+
+const fn lane(event: &ActorEvent) -> Lane {
+    if is_bulk(event) {
+        Lane::Output
+    } else {
+        Lane::Control
+    }
+}
+
 pub(crate) struct Mailbox {
     state: Mutex<MailboxState>,
     pub(crate) arrived: Condvar,
-    pub(crate) room: Condvar,
+    /// One condvar per lane, so a producer is only ever woken for the slot it
+    /// is waiting on. Shared, a dequeue woke the PTY reader, every
+    /// `brd-forward-read` thread and every `brd-attachment` thread at once, and
+    /// all but one re-took the lock only to park again.
+    control_room: Condvar,
+    output_room: Condvar,
+}
+
+impl Mailbox {
+    fn room(&self, lane: Lane) -> &Condvar {
+        match lane {
+            Lane::Control => &self.control_room,
+            Lane::Output => &self.output_room,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -170,19 +202,24 @@ impl MailboxState {
     }
 
     pub(crate) fn push(&mut self, event: ActorEvent) {
-        if is_bulk(&event) {
-            self.output.push_back(event);
-        } else {
-            self.control.push_back(event);
+        match lane(&event) {
+            Lane::Output => self.output.push_back(event),
+            Lane::Control => self.control.push_back(event),
         }
     }
 
-    pub(crate) fn take(&mut self) -> Option<ActorEvent> {
-        self.control.pop_front().or_else(|| self.output.pop_front())
+    pub(crate) fn take(&mut self) -> Option<(ActorEvent, Lane)> {
+        if let Some(event) = self.control.pop_front() {
+            return Some((event, Lane::Control));
+        }
+        self.output.pop_front().map(|event| (event, Lane::Output))
     }
 
-    fn lanes_full(&self) -> bool {
-        self.control.len() >= CONTROL_LANE || self.output.len() >= OUTPUT_LANE
+    fn full(&self, lane: Lane) -> bool {
+        match lane {
+            Lane::Control => self.control.len() >= CONTROL_LANE,
+            Lane::Output => self.output.len() >= OUTPUT_LANE,
+        }
     }
 }
 
@@ -203,10 +240,11 @@ pub(crate) enum NoEvent {
 pub(crate) struct MailboxSender(Arc<Mailbox>);
 
 impl MailboxSender {
-    /// Waits for room in its *own* lane: the PTY reader parking here is
-    /// backpressure on the shell, and a keystroke that waited behind it would
-    /// wait out the flood it interrupts.
+    /// Waits for room in its *own* lane, on that lane's own condvar: the PTY reader
+    /// parking here is backpressure on the shell, and a keystroke that waited behind
+    /// it would wait out the flood it interrupts.
     pub(crate) fn send(&self, event: ActorEvent) -> Result<(), MailboxClosed> {
+        let room = self.0.room(lane(&event));
         let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if state.closed {
@@ -220,11 +258,7 @@ impl MailboxSender {
                 self.0.arrived.notify_one();
                 return Ok(());
             }
-            state = self
-                .0
-                .room
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
+            state = room.wait(state).unwrap_or_else(PoisonError::into_inner);
         }
     }
 
@@ -238,6 +272,7 @@ impl MailboxSender {
         timeout: Duration,
     ) -> Result<(), TrySendError> {
         let deadline = Instant::now() + timeout;
+        let room = self.0.room(lane(&event));
         let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if state.closed {
@@ -256,9 +291,7 @@ impl MailboxSender {
                 drop(state);
                 return Err(TrySendError::Full);
             };
-            let (next, _) = self
-                .0
-                .room
+            let (next, _) = room
                 .wait_timeout(state, left)
                 .unwrap_or_else(PoisonError::into_inner);
             state = next;
@@ -318,11 +351,28 @@ impl MailboxReceiver {
         loop {
             // Read before the pop, and only then: a lane below its bound has
             // nobody parked on it, and this runs once per PTY read.
-            let full = state.lanes_full();
-            if let Some(event) = state.take() {
+            let control_full = state.full(Lane::Control);
+            let output_full = state.full(Lane::Output);
+            if let Some((event, popped)) = state.take() {
+                let freed = match popped {
+                    Lane::Control => control_full,
+                    Lane::Output => output_full,
+                };
                 drop(state);
-                if full {
-                    self.0.room.notify_all();
+                if freed {
+                    match popped {
+                        // Every producer parked here is waiting on the same
+                        // `output.len() < OUTPUT_LANE`, so exactly one is woken
+                        // and the rest are left where they are.
+                        Lane::Output => self.0.output_room.notify_one(),
+                        // Not one: `Kill` waits on a slot *past* the bound, so
+                        // a control waiter may hold a weaker condition than the
+                        // one this pop satisfied, and waking that one alone
+                        // leaves the sender the slot opened for asleep. A
+                        // producer parks here only behind CONTROL_LANE queued
+                        // events, which is not the case this exists to fix.
+                        Lane::Control => self.0.control_room.notify_all(),
+                    }
                 }
                 return Ok(event);
             }
@@ -349,8 +399,9 @@ impl Drop for MailboxReceiver {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .closed = true;
-        // Everything parked on a lane that will never have room again.
-        self.0.room.notify_all();
+        // Everything parked on either lane, none of which will have room again.
+        self.0.control_room.notify_all();
+        self.0.output_room.notify_all();
     }
 }
 
@@ -361,7 +412,8 @@ pub(crate) fn mailbox() -> (MailboxSender, MailboxReceiver) {
             ..MailboxState::default()
         }),
         arrived: Condvar::new(),
-        room: Condvar::new(),
+        control_room: Condvar::new(),
+        output_room: Condvar::new(),
     });
     (
         MailboxSender(Arc::clone(&mailbox)),
@@ -468,6 +520,116 @@ mod tests {
             waited.recv_timeout(Duration::from_secs(2)),
             Ok(true),
             "the reader was never woken by the room it was waiting for"
+        );
+    }
+
+    /// A dequeue frees a slot in exactly one lane, and wakes one producer on
+    /// that lane alone. Waking one is only sound because every producer parked
+    /// there wants the slot that opened — on a shared condvar the woken thread
+    /// may be waiting on the other lane, find no room, park again, and leave
+    /// the producer the slot was for asleep with nothing left to wake it.
+    #[test]
+    fn a_control_dequeue_frees_the_control_sender_and_not_the_output_one() {
+        let (tx, rx) = mailbox();
+        for _ in 0..OUTPUT_LANE {
+            tx.try_send(pty_output(b"yes\n"))
+                .expect("a free output slot");
+        }
+        for _ in 0..CONTROL_LANE {
+            tx.try_send(ActorEvent::Detached(AttachmentId(1)))
+                .expect("a free control slot");
+        }
+
+        let (finished, waited) = mpsc::channel();
+        for (label, event) in [
+            ("output", pty_output(b"yes\n")),
+            ("control", ActorEvent::Detached(AttachmentId(2))),
+        ] {
+            let sender = tx.clone();
+            let done = finished.clone();
+            thread::spawn(move || {
+                let _ = done.send((label, sender.send(event).is_ok()));
+            });
+        }
+        assert!(
+            waited.recv_timeout(REAP_POLL * 10).is_err(),
+            "a lane at its bound took another event"
+        );
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::ZERO),
+            Ok(ActorEvent::Detached(_))
+        ));
+        assert_eq!(
+            waited.recv_timeout(Duration::from_secs(2)),
+            Ok(("control", true)),
+            "the control slot went to a producer that was not waiting for one"
+        );
+        assert!(
+            waited.recv_timeout(REAP_POLL * 10).is_err(),
+            "a control dequeue handed room to a producer waiting on output"
+        );
+
+        // `take` empties control first, so reaching the output lane at all
+        // means draining what is queued ahead of it.
+        loop {
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(ActorEvent::PtyOutput(_)) => break,
+                Ok(_) => {}
+                Err(NoEvent::Timeout | NoEvent::Disconnected) => {
+                    panic!("the output lane was never reached")
+                }
+            }
+        }
+        assert_eq!(
+            waited.recv_timeout(Duration::from_secs(2)),
+            Ok(("output", true)),
+            "the reader was never woken by the room it was waiting for"
+        );
+    }
+
+    /// `Kill` waits on a slot *past* the ordinary bound, so two producers on
+    /// the control lane can hold different conditions. A pop that opens the
+    /// reserved slot must reach the sender it opened for: waking one waiter
+    /// there can wake the one that still has no room, and the kill then waits
+    /// out its whole deadline for room it already had.
+    #[test]
+    fn a_pop_into_the_reserved_slot_reaches_the_kill_waiting_for_it() {
+        let (tx, rx) = mailbox();
+        for _ in 0..CONTROL_LANE {
+            tx.try_send(ActorEvent::Detached(AttachmentId(1)))
+                .expect("a free control slot");
+        }
+        tx.try_send(kill()).expect("a kill draws on reserved room");
+
+        let (finished, waited) = mpsc::channel();
+        let ordinary = tx.clone();
+        let done = finished.clone();
+        thread::spawn(move || {
+            let _ = done.send(ordinary.send(ActorEvent::Detached(AttachmentId(2))).is_ok());
+        });
+        let killer = tx.clone();
+        thread::spawn(move || {
+            let sent = killer.send_timeout(kill(), Duration::from_secs(5)).is_ok();
+            let _ = finished.send(sent);
+        });
+        assert!(
+            waited.recv_timeout(REAP_POLL * 10).is_err(),
+            "the lane is full for both of them"
+        );
+
+        // One pop, and then nothing: the lane is back at its bound, which is
+        // room for the kill and not for the ordinary sender.
+        assert!(rx.recv_timeout(Duration::ZERO).is_ok());
+        let began = Instant::now();
+        assert_eq!(
+            waited.recv_timeout(Duration::from_secs(2)),
+            Ok(true),
+            "the kill never took the slot opened for it"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "the kill waited out its own deadline for room it already had"
         );
     }
 

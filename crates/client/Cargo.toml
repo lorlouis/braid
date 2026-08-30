@@ -16,6 +16,11 @@ signal-hook.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
 
+# `IP_DONTFRAG`/`IPV6_DONTFRAG` are what refusing fragmentation is off Linux;
+# rustix exposes neither.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 braid-vt = { path = "../vt" }
 

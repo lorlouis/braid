@@ -28,6 +28,18 @@ const DEFLATE_FLOOR: usize = 256;
 /// growth loop below exists for the hostile case.
 const INFLATE_GUESS: usize = 1024;
 
+/// What one deflated body is guessed to inflate to, before the growth loop. The
+/// measurement at [`DEFLATE_LEVEL`] is 4.74x and `attachment.rs`'s `RATIO_CEILING`
+/// is 6x, so a 4x guess makes *every* screen datagram take the growth path: two
+/// reservations and two decompressor entries where one of each would do.
+const INFLATE_RATIO: usize = 8;
+
+/// How much inflate scratch stays resident between calls, capacity included. A frame
+/// that inflated wider than this gives its room back as soon as a narrower one
+/// follows, rather than leaving that room alive per connection for the sake of
+/// datagrams that inflate to ten kilobytes.
+const INFLATE_RETAIN: usize = 128 * 1024;
+
 /// Stack a thread must have spare the first time it packs: `CompressorOxide` is 64 KiB
 /// by value with no way to build one onto the heap without `unsafe`, and measured, the
 /// initialiser peaks at close to four copies. A 256 KiB sink thread aborted the whole
@@ -68,15 +80,30 @@ pub fn pack_from(payload: &[u8], out: &mut Vec<u8>, at: usize) {
     if payload.len() >= DEFLATE_FLOOR && deflate_into(payload, out, at) {
         return;
     }
+    store_from(payload, out, at);
+}
+
+/// The stored framing without the codec's decision, for a caller that has already
+/// made it. Byte for byte what [`pack`] writes for a payload the codec declines.
+pub fn store(payload: &[u8], out: &mut Vec<u8>) {
+    store_from(payload, out, 0);
+}
+
+fn store_from(payload: &[u8], out: &mut Vec<u8>, at: usize) {
     out.truncate(at);
     out.push(TAG_STORED);
     out.extend_from_slice(payload);
 }
 
-/// Room for `len` bytes the caller overwrites in full. No `clear` before the `resize`:
-/// that would zero every byte about to be written over. [`crate::read_frame_into`]'s rule.
+/// Room for `len` bytes the caller overwrites in full. Growth only, and never a
+/// `clear`: `Vec::resize` zeroes what it grows into, so a buffer left at its
+/// high-water length is one that never pays that memset again. The inflate
+/// ceiling is applied by *slicing* this buffer rather than by shortening it.
+/// [`crate::read_frame_into`]'s rule.
 fn room_for(out: &mut Vec<u8>, len: usize) {
-    out.resize(len, 0);
+    if out.len() < len {
+        out.resize(len, 0);
+    }
 }
 
 /// The scratch is one byte shorter than stored would cost, collapsing "did not fit"
@@ -85,10 +112,17 @@ fn deflate_into(payload: &[u8], out: &mut Vec<u8>, at: usize) -> bool {
     // `room_for` grows without clearing, so `out[..at]` - the caller's prefix - survives.
     room_for(out, at + payload.len());
     out[at] = TAG_DEFLATE;
+    // Sliced to exactly that width rather than to the buffer's end: `room_for` only
+    // grows, so a warm buffer is longer than this frame and an unsliced tail would
+    // let a payload that *grew* still report `Done`.
     let Some(written) = DEFLATE.with_borrow_mut(|state| {
         state.reset();
-        let (status, read, written) =
-            compress(state, payload, &mut out[at + 1..], TDEFLFlush::Finish);
+        let (status, read, written) = compress(
+            state,
+            payload,
+            &mut out[at + 1..at + payload.len()],
+            TDEFLFlush::Finish,
+        );
         (status == TDEFLStatus::Done && read == payload.len()).then_some(written)
     }) else {
         return false;
@@ -97,41 +131,53 @@ fn deflate_into(payload: &[u8], out: &mut Vec<u8>, at: usize) -> bool {
     true
 }
 
-/// Recover a datagram's payload. Bounded: `unpack` refuses anything that
-/// would inflate past `limit`.
-pub fn unpack(datagram_body: &[u8], limit: usize, out: &mut Vec<u8>) -> Result<(), DecodeError> {
+/// Recover a datagram's payload, borrowed: from `datagram_body` when it was stored,
+/// and from `out` when it was deflated. `out` is the caller's reused scratch either
+/// way, so the common stored path costs no copy at all — a forwarded byte copied out
+/// of the datagram buffer would only be copied straight back out of it.
+///
+/// Bounded: `unpack` refuses anything that would inflate past `limit`.
+pub fn unpack<'a>(
+    datagram_body: &'a [u8],
+    limit: usize,
+    out: &'a mut Vec<u8>,
+) -> Result<&'a [u8], DecodeError> {
     let (&tag, body) = datagram_body.split_first().ok_or(DecodeError::Truncated)?;
     match tag {
         TAG_STORED => {
             if body.len() > limit {
                 return Err(DecodeError::InvalidField);
             }
-            // `extend_from_slice` after a `clear` copies and never zeroes, so this
-            // path owes nothing to [`room_for`].
-            out.clear();
-            out.extend_from_slice(body);
-            Ok(())
+            Ok(body)
         }
-        TAG_DEFLATE => inflate_into(body, limit, out),
+        TAG_DEFLATE => {
+            let filled = inflate_into(body, limit, out)?;
+            Ok(&out[..filled])
+        }
         _ => Err(DecodeError::InvalidField),
     }
 }
 
-/// The ceiling is applied to the buffer, not to a claimed length, because deflate
-/// carries no such claim: a payload that decompresses forever is refused once its room
-/// reaches `limit`, having reserved exactly that and not a byte more.
-fn inflate_into(body: &[u8], limit: usize, out: &mut Vec<u8>) -> Result<(), DecodeError> {
+/// The ceiling is applied to the slice handed to the decompressor, not to a claimed
+/// length, because deflate carries no such claim: a payload that decompresses forever
+/// is refused once its room reaches `limit`, having been offered exactly that and not
+/// a byte more. Answers how much of `out` it filled.
+fn inflate_into(body: &[u8], limit: usize, out: &mut Vec<u8>) -> Result<usize, DecodeError> {
     let mut input = body;
-    let mut room = body.len().saturating_mul(4).max(INFLATE_GUESS).min(limit);
+    let mut room = body
+        .len()
+        .saturating_mul(INFLATE_RATIO)
+        .max(INFLATE_GUESS)
+        .min(limit);
     room_for(out, room);
     let mut filled = 0_usize;
-    INFLATE.with_borrow_mut(|state| {
+    let outcome = INFLATE.with_borrow_mut(|state| {
         state.init();
         loop {
             let (status, read, written) = decompress(
                 state,
                 input,
-                out,
+                &mut out[..room],
                 filled,
                 inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
             );
@@ -139,10 +185,7 @@ fn inflate_into(body: &[u8], limit: usize, out: &mut Vec<u8>) -> Result<(), Deco
             match status {
                 // A stream ending with input to spare is `TrailingBytes` on the stream
                 // path; admitting it here is a second encoding of every payload.
-                TINFLStatus::Done if read == input.len() => {
-                    out.truncate(filled);
-                    return Ok(());
-                }
+                TINFLStatus::Done if read == input.len() => return Ok(filled),
                 // `read` is bounded by the library, but a slice index that trusts it
                 // is a panic path in a decoder that promises not to have one.
                 TINFLStatus::HasMoreOutput if read <= input.len() && room < limit => {
@@ -150,13 +193,22 @@ fn inflate_into(body: &[u8], limit: usize, out: &mut Vec<u8>) -> Result<(), Deco
                     room = room.saturating_mul(2).min(limit);
                     room_for(out, room);
                 }
-                _ => {
-                    out.clear();
-                    return Err(DecodeError::InvalidField);
-                }
+                _ => return Err(DecodeError::InvalidField),
             }
         }
-    })
+    });
+    let filled = outcome?;
+    // `truncate` alone would only move the length: the room a wide frame reserved
+    // stays allocated until the capacity goes back with it, and paying the length
+    // without the memory is the worst of both — `room_for` grows without zeroing
+    // only while the high-water length stands. Held until a frame that fits under
+    // the line, so a stream inflating above it every time is not a realloc and a
+    // full memcpy per frame to reclaim the gap between its room and its answer.
+    if filled <= INFLATE_RETAIN && out.len() > INFLATE_RETAIN {
+        out.truncate(INFLATE_RETAIN);
+        out.shrink_to(INFLATE_RETAIN);
+    }
+    Ok(filled)
 }
 
 #[cfg(test)]
@@ -188,8 +240,69 @@ mod tests {
         let mut packed = Vec::new();
         pack(payload, &mut packed);
         let mut out = Vec::new();
-        unpack(&packed, 1 << 20, &mut out).expect("a payload this side just packed");
-        out
+        unpack(&packed, 1 << 20, &mut out)
+            .expect("a payload this side just packed")
+            .to_vec()
+    }
+
+    /// Whether the answer came out of the caller's datagram rather than its scratch.
+    fn borrowed_from_body(packed: &[u8], out: &mut Vec<u8>) -> bool {
+        let body = unpack(packed, 1 << 20, out).expect("a payload this side just packed");
+        body.as_ptr_range().start >= packed.as_ptr_range().start
+            && body.as_ptr_range().end <= packed.as_ptr_range().end
+    }
+
+    /// The point of the borrowed answer: a stored body is already contiguous inside
+    /// the datagram the caller holds, so copying it into scratch buys nothing.
+    #[test]
+    fn a_stored_payload_is_answered_out_of_the_datagram_rather_than_copied() {
+        let mut packed = Vec::new();
+        pack(b"opaque forwarded bytes", &mut packed);
+        assert_eq!(packed[0], TAG_STORED);
+        let mut out = Vec::new();
+        assert!(borrowed_from_body(&packed, &mut out));
+        assert!(out.is_empty(), "the stored path touched the scratch");
+
+        let screen = b"\x1b[1;32muser@host\x1b[0m:~$ ".repeat(400);
+        let mut deflated = Vec::new();
+        pack(&screen, &mut deflated);
+        assert_eq!(deflated[0], TAG_DEFLATE);
+        assert!(
+            !borrowed_from_body(&deflated, &mut out),
+            "a deflated payload has to come out of the scratch"
+        );
+    }
+
+    /// A screen datagram inflates about fivefold, so a guess under that put every one
+    /// of them through the growth loop.
+    #[test]
+    fn a_screens_worth_of_deflate_inflates_without_growing_the_buffer() {
+        // Repetition against noise, which is what a real screen is: runs of the same
+        // prompt and box drawing over text that does not repeat.
+        let mut screen = Vec::new();
+        let mut state = 0x243f_6a88_85a3_08d3_u64;
+        while screen.len() < 6000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            screen.extend_from_slice(b"\x1b[1;32muser@host\x1b[0m:~$ ");
+            screen.extend_from_slice(&state.to_be_bytes());
+        }
+        let mut packed = Vec::new();
+        pack(&screen, &mut packed);
+        assert_eq!(packed[0], TAG_DEFLATE);
+        let body = &packed[1..];
+        assert!(
+            screen.len() <= body.len() * INFLATE_RATIO,
+            "this payload's {}x ratio is past the first guess",
+            screen.len() / body.len()
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            inflate_into(body, 1 << 20, &mut out).expect("it inflates"),
+            screen.len()
+        );
+        assert_eq!(&out[..screen.len()], screen.as_slice());
     }
 
     #[test]
@@ -228,6 +341,29 @@ mod tests {
         }
     }
 
+    /// A caller that skips the codec writes the framing the other side already
+    /// decodes, and the decision is the only thing it skips.
+    #[test]
+    fn a_stored_payload_is_written_the_way_pack_writes_one() {
+        let mut stored = Vec::new();
+        let mut packed = Vec::new();
+        for payload in corpus() {
+            store(&payload, &mut stored);
+            assert_eq!(stored[0], TAG_STORED, "len {}", payload.len());
+            let mut out = Vec::new();
+            assert_eq!(
+                unpack(&stored, 1 << 20, &mut out).expect("a payload this side just stored"),
+                payload.as_slice(),
+                "len {}",
+                payload.len()
+            );
+            if payload.len() < DEFLATE_FLOOR {
+                pack(&payload, &mut packed);
+                assert_eq!(packed, stored, "len {}", payload.len());
+            }
+        }
+    }
+
     #[test]
     fn a_truncated_deflate_stream_is_refused_rather_than_fatal() {
         let screen = b"\x1b[1;32muser@host\x1b[0m:~$ ".repeat(400);
@@ -242,27 +378,34 @@ mod tests {
     }
 
     /// The stream path refuses a body with bytes left over, so admitting one here would
-    /// give the datagram path a second spelling of every payload.
+    /// give the datagram path a second spelling of every payload. Nothing of a refused
+    /// body is readable — the answer is borrowed and there is none — so what is left to
+    /// hold it to is the scratch it reserved, which stays inside the caller's ceiling.
     #[test]
     fn bytes_appended_after_a_deflate_stream_are_refused() {
         let screen = b"\x1b[1;32muser@host\x1b[0m:~$ ".repeat(400);
         let mut packed = Vec::new();
         pack(&screen, &mut packed);
         assert_eq!(packed[0], TAG_DEFLATE);
+        let ceiling = 1 << 20;
         let mut out = Vec::new();
-        unpack(&packed, 1 << 20, &mut out).expect("a payload this side just packed");
+        unpack(&packed, ceiling, &mut out).expect("a payload this side just packed");
         for trailer in [&[0_u8][..], &[0xff][..], &b"garbage"[..], &packed[1..]] {
             let mut extended = packed.clone();
             extended.extend_from_slice(trailer);
             assert!(
                 matches!(
-                    unpack(&extended, 1 << 20, &mut out),
+                    unpack(&extended, ceiling, &mut out),
                     Err(DecodeError::InvalidField)
                 ),
                 "a stream with {} bytes appended decoded anyway",
                 trailer.len()
             );
-            assert!(out.is_empty(), "a refused body left {} bytes", out.len());
+            assert!(
+                out.capacity() <= ceiling,
+                "a refused body reserved {} bytes past the ceiling",
+                out.capacity()
+            );
         }
     }
 
@@ -359,15 +502,54 @@ mod tests {
         assert_eq!((packed.capacity(), out.capacity()), (packed_room, out_room));
     }
 
-    /// The rule [`crate::read_frame_into`] is written against, on the datagram path.
+    /// The rule [`crate::read_frame_into`] is written against, on the datagram path:
+    /// room is made by growing, never by zeroing, and never by shortening — the
+    /// ceiling is enforced on the slice handed to the decompressor instead.
     #[test]
     fn making_room_in_a_warm_buffer_does_not_zero_what_is_about_to_be_overwritten() {
         let mut out = vec![0xAA_u8; 4096];
         room_for(&mut out, 1024);
-        assert_eq!(out.len(), 1024);
+        assert_eq!(out.len(), 4096, "a warm buffer was shortened back down");
+        room_for(&mut out, 8192);
         assert!(
-            out.iter().all(|&byte| byte == 0xAA),
+            out[..4096].iter().all(|&byte| byte == 0xAA),
             "the buffer was zeroed before the codec wrote a byte of it"
+        );
+    }
+
+    /// A warm buffer's high-water length is what stops `resize` zeroing on every
+    /// datagram, and a single oversize frame must not make that resident for ever —
+    /// which is the capacity, not the length: shortening a `Vec` frees nothing. The
+    /// room goes back on the frame that fits under the line, never on the wide one,
+    /// so a run of wide frames pays no copy for the room the next one wants anyway.
+    #[test]
+    fn a_giant_inflate_does_not_leave_its_room_resident() {
+        let giant = vec![b'z'; INFLATE_RETAIN * 2];
+        let mut packed = Vec::new();
+        pack(&giant, &mut packed);
+        let mut out = Vec::new();
+        assert_eq!(
+            unpack(&packed, 1 << 21, &mut out)
+                .expect("a payload this side just packed")
+                .len(),
+            giant.len()
+        );
+        assert!(
+            out.capacity() > INFLATE_RETAIN,
+            "a frame this wide gave its room back to the frame after it"
+        );
+
+        let small = b"the same line over and over ".repeat(64);
+        pack(&small, &mut packed);
+        assert_eq!(packed[0], TAG_DEFLATE, "the test payload must compress");
+        assert_eq!(
+            unpack(&packed, 1 << 21, &mut out).expect("a payload this side just packed"),
+            small.as_slice()
+        );
+        assert!(
+            out.capacity() <= INFLATE_RETAIN,
+            "a megabyte of scratch stayed resident: {} bytes",
+            out.capacity()
         );
     }
 
@@ -377,15 +559,31 @@ mod tests {
         let mut packed = vec![0xAA_u8; 8192];
         let mut out = vec![0xBB_u8; 8192];
 
-        let stored = b"short".to_vec();
-        pack(&stored, &mut packed);
-        unpack(&packed, 1 << 20, &mut out).expect("a payload this side just packed");
-        assert_eq!(out, stored);
-
         let deflated = b"the same line over and over ".repeat(64);
         pack(&deflated, &mut packed);
         assert_eq!(packed[0], TAG_DEFLATE, "the test payload must compress");
-        unpack(&packed, 1 << 20, &mut out).expect("a payload this side just packed");
-        assert_eq!(out, deflated);
+        assert_eq!(
+            unpack(&packed, 1 << 20, &mut out).expect("a payload this side just packed"),
+            deflated.as_slice()
+        );
+
+        let shorter = b"a shorter line, still over and over ".repeat(8);
+        pack(&shorter, &mut packed);
+        assert_eq!(packed[0], TAG_DEFLATE);
+        assert_eq!(
+            unpack(&packed, 1 << 20, &mut out).expect("a payload this side just packed"),
+            shorter.as_slice(),
+            "the longer frame before it bled through"
+        );
+
+        // The stored path answers out of the datagram, so the scratch it never
+        // touched must not be mistaken for the payload.
+        let stored = b"short".to_vec();
+        pack(&stored, &mut packed);
+        assert_eq!(packed[0], TAG_STORED);
+        assert_eq!(
+            unpack(&packed, 1 << 20, &mut out).expect("a payload this side just packed"),
+            stored.as_slice()
+        );
     }
 }

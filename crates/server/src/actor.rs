@@ -528,17 +528,10 @@ impl SessionActor {
 
     /// Tell one client how much of the stream it will never be handed.
     ///
-    /// Gated on the negotiated version because a *message* the peer does not know
-    /// is a hard decode error rather than a skipped field: an older client must
-    /// never be sent one. A failure to queue it is ignored — the screen behind it
-    /// is what the session actually owes, and the next send reports the same fault.
+    /// A failure to queue it is ignored — the screen behind it is what the session
+    /// actually owes, and the next send reports the same fault.
     fn report_skipped(&mut self, index: usize, bytes: u64) {
-        if bytes == 0
-            || !self.attachments[index]
-                .sink
-                .version()
-                .carries_output_skipped()
-        {
+        if bytes == 0 {
             return;
         }
         log!("attachment resumed {bytes} bytes past what it will be handed");
@@ -553,6 +546,12 @@ impl SessionActor {
             return false;
         };
         self.info.touch();
+        // Anything but the answer to a probe is traffic, and traffic paces the
+        // link by the link again; a `Pong` counted as traffic would hold an idle
+        // session at the probe floor for ever, which is what it backs off from.
+        if !matches!(message, ClientMessage::Pong { .. }) {
+            self.attachments[index].link.stirred();
+        }
         match message {
             ClientMessage::Input { seq, bytes } => {
                 let Some(terminal) = self.terminal.as_ref() else {
@@ -924,6 +923,10 @@ impl SessionActor {
                 gone.push(attachment.id);
             } else if let Some(token) = attachment.link.probe(now) {
                 let echo_ack = attachment.stream.echo_ack(now);
+                // Read after `probe`: what this `Ping` promises is the interval
+                // that scheduled it, and the idle backoff only moves on the
+                // answer to it - so the next probe is due at twice this, inside
+                // the three of them the client waits.
                 let interval_ms = attachment.link.interval_ms();
                 if attachment
                     .sink
@@ -2469,45 +2472,6 @@ mod tests {
         assert!(
             actor.attachments[0].repaint_pending,
             "the screen that replaces the history was never armed"
-        );
-    }
-
-    /// The gate that keeps a tag out of a decoder too old to know it. A field would be
-    /// skipped; an unknown *message* is a hard error that ends a working session.
-    #[test]
-    fn a_client_that_predates_the_notice_is_never_sent_one() {
-        let (mut actor, _release, _pty) = wedged_actor();
-        actor.offset = ByteOff::from_u64(sink::STREAM_LIMIT as u64 * 4);
-
-        let output = TestOutput::new();
-        actor.attach(
-            next_attachment(),
-            client(1),
-            // The oldest peer this build still speaks to.
-            AttachmentSink::new(Box::new(output.clone()), Version::FLOOR).expect("attachment"),
-            AttachKind::Resume(ConfirmedOutput {
-                generation: actor.generation,
-                next_off: ByteOff::zero(),
-            }),
-            Framing::Stream,
-            None,
-        );
-
-        // The screen still arrives: what is withheld is the diagnostic, not the repair.
-        assert!(
-            actor.attachments[0].repaint_pending,
-            "the resume was not answered with a screen"
-        );
-        assert!(
-            !actor.attachments[0].sink.version().carries_output_skipped(),
-            "the fixture stopped being an older peer, so this proves nothing"
-        );
-        assert!(
-            !output
-                .frames()
-                .iter()
-                .any(|message| matches!(message, ServerMessage::OutputSkipped { .. })),
-            "a tag this peer cannot decode was put on its wire"
         );
     }
 

@@ -1255,7 +1255,7 @@ fn write_cup<W: Write>(output: &mut W, cursor: Option<(u16, u16)>) -> io::Result
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Patch {
     Nothing,
     /// Paint `[from, to)` at `col`, erasing what follows when `erase`.
@@ -1278,6 +1278,18 @@ fn row_patch(old: &RowFrame, new: &RowFrame, clear_tail: bool) -> Patch {
     let (Some(was), Some(now)) = (painted_cells(old), painted_cells(new)) else {
         return Patch::Whole;
     };
+    // `clear_tail` is the server saying the row got shorter.
+    let erase = clear_tail || was.cells() > now.cells();
+    if let (Painted::Ascii(was), Painted::Ascii(now)) = (was, now) {
+        return ascii_patch(old, new, was, now, erase);
+    }
+    measured_patch(old, new, erase)
+}
+
+/// A cluster at a time, which is two width lookups per `peek` and four `peek`s
+/// per matched column. A vim scroll changes every row, so this is the walk
+/// [`ascii_patch`] exists to keep off a screen whose columns are provable.
+fn measured_patch(old: &RowFrame, new: &RowFrame, erase: bool) -> Patch {
     let mut before = Cells::new(old);
     let mut after = Cells::new(new);
     let mut first: Option<(u16, usize)> = None;
@@ -1289,6 +1301,11 @@ fn row_patch(old: &RowFrame, new: &RowFrame, clear_tail: bool) -> Patch {
             continue;
         }
         first.get_or_insert((after.col, after.byte));
+        // An erase already paints to the end of the row, so nothing past the
+        // first difference can move `to`.
+        if erase {
+            break;
+        }
         // Off a shared column the two rows are not comparable — a wide glyph on
         // one side straddles a boundary on the other — so the lagging walk moves.
         if before.col <= after.col {
@@ -1299,8 +1316,6 @@ fn row_patch(old: &RowFrame, new: &RowFrame, clear_tail: bool) -> Patch {
         }
         last = after.byte;
     }
-    // `clear_tail` is the server saying the row got shorter.
-    let erase = clear_tail || was > now;
     let Some((col, from)) = first else {
         return Patch::Nothing;
     };
@@ -1310,6 +1325,137 @@ fn row_patch(old: &RowFrame, new: &RowFrame, clear_tail: bool) -> Patch {
         from,
         to: to.max(from),
         erase,
+    }
+}
+
+/// A column *is* a byte on a row [`painted_cells`] found all-ASCII, so the same
+/// answer is two byte compares and one walk of the runs: no cluster is measured
+/// and the width table never opens.
+fn ascii_patch(
+    old: &RowFrame,
+    new: &RowFrame,
+    was: AsciiCells,
+    now: AsciiCells,
+    erase: bool,
+) -> Patch {
+    // A byte per cell, so these are `painted_bytes`.
+    let (was, now) = (usize::from(was.0), usize::from(now.0));
+    let before = &old.text.as_bytes()[..was];
+    let after = &new.text.as_bytes()[..now];
+    let shared = was.min(now);
+    let width = was.max(now);
+
+    let mut first: Option<usize> = None;
+    let mut last = 0_usize;
+    let common = common_prefix(&before[..shared], &after[..shared]);
+    if common < shared {
+        first = Some(common);
+        last = shared - common_suffix(&before[..shared], &after[..shared]);
+    }
+    // Past one row's paint the other compares against the blank the encoder
+    // dropped, which is a space under the default style.
+    let overhang = if was > now {
+        &before[shared..]
+    } else {
+        &after[shared..]
+    };
+    if let Some(at) = overhang.iter().position(|&byte| byte != b' ') {
+        first.get_or_insert(shared + at);
+    }
+    if let Some(at) = overhang.iter().rposition(|&byte| byte != b' ') {
+        last = shared + at + 1;
+    }
+
+    // Style holds across a run, so the two rows can only disagree over the
+    // intervals their boundaries cut — a handful, not one per column.
+    let mut before_runs = Runs::new(old);
+    let mut after_runs = Runs::new(new);
+    let mut at = 0_usize;
+    while at < width {
+        let end = before_runs.bound().min(after_runs.bound()).min(width);
+        if before_runs.style() != after_runs.style() {
+            first = Some(first.map_or(at, |seen| seen.min(at)));
+            last = last.max(end);
+        }
+        at = end;
+        before_runs.seek(at);
+        after_runs.seek(at);
+    }
+
+    let Some(first) = first else {
+        return Patch::Nothing;
+    };
+    let from = first.min(now);
+    let to = if erase { now } else { last.min(now) };
+    Patch::Columns {
+        // A column of a row, and a row's cell count is a `u16`.
+        col: u16::try_from(first).unwrap_or(u16::MAX),
+        from,
+        to: to.max(from),
+        erase,
+    }
+}
+
+/// Both slices are the same length.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    a.iter()
+        .zip(b.iter())
+        .position(|(x, y)| x != y)
+        .unwrap_or(a.len())
+}
+
+/// Both slices are the same length.
+fn common_suffix(a: &[u8], b: &[u8]) -> usize {
+    a.iter()
+        .rev()
+        .zip(b.iter().rev())
+        .position(|(x, y)| x != y)
+        .unwrap_or(a.len())
+}
+
+/// The run covering a byte, advanced by the rule [`Cells`] advances by, so the
+/// two walks name the same style for the same column.
+struct Runs<'a> {
+    row: &'a RowFrame,
+    index: usize,
+    end: usize,
+}
+
+impl<'a> Runs<'a> {
+    fn new(row: &'a RowFrame) -> Self {
+        Self {
+            row,
+            index: 0,
+            end: row.runs.first().map_or(0, |run| run.bytes as usize),
+        }
+    }
+
+    /// Past the last run every cell carries the default style, so there is no
+    /// boundary left to cut an interval at.
+    fn bound(&self) -> usize {
+        if self.index < self.row.runs.len() {
+            self.end
+        } else {
+            usize::MAX
+        }
+    }
+
+    fn style(&self) -> CellStyle {
+        self.row
+            .runs
+            .get(self.index)
+            .map_or_else(CellStyle::default, |run| run.style)
+    }
+
+    fn seek(&mut self, byte: usize) {
+        while self.index < self.row.runs.len() && byte >= self.end {
+            self.index += 1;
+            self.end += self
+                .row
+                .runs
+                .get(self.index)
+                .map_or(0, |run| run.bytes as usize);
+        }
     }
 }
 
@@ -1405,21 +1551,57 @@ fn lead_cells(c: char) -> u16 {
     }
 }
 
-fn text_cells(text: &str) -> u32 {
-    text.chars().map(|c| u32::from(lead_cells(c))).sum()
+/// The count, and whether the scan that produced it was the ASCII one: a row
+/// wants both, and the two answers come from the same walk.
+fn text_cells(text: &str) -> (u32, bool) {
+    // `lead_cells` is one for every ASCII scalar, and `is_ascii` is a word at a
+    // time where the walk below is a width-table lookup per character.
+    if text.is_ascii() {
+        return (u32::try_from(text.len()).unwrap_or(u32::MAX), true);
+    }
+    (text.chars().map(|c| u32::from(lead_cells(c))).sum(), false)
+}
+
+/// The proof itself: only [`painted_cells`] builds one, and [`ascii_patch`]
+/// takes nothing else.
+#[derive(Clone, Copy)]
+struct AsciiCells(u16);
+
+/// What [`painted_cells`] proved. `Ascii` is the stronger claim — every painted
+/// byte is ASCII, so `text_cells` is `len`, a column *is* a byte, and the count
+/// below is also `painted_bytes`. No ZWJ sequence, combining mark or wide glyph
+/// can arise there, which is the whole of what the fast diff rests on.
+#[derive(Clone, Copy)]
+enum Painted {
+    Ascii(AsciiCells),
+    Measured(u16),
+}
+
+impl Painted {
+    const fn cells(self) -> u16 {
+        match self {
+            Self::Ascii(AsciiCells(cells)) | Self::Measured(cells) => cells,
+        }
+    }
 }
 
 /// A style run's `cells` is what libghostty counted and the only checkpoint a
 /// row carries; past the last run there is none, so only ASCII is walked there.
 /// What this refuses is repainted from column one.
-fn painted_cells(row: &RowFrame) -> Option<u16> {
+fn painted_cells(row: &RowFrame) -> Option<Painted> {
     let mut at = 0_usize;
     let mut cells = 0_u16;
+    let mut ascii = true;
     for run in &row.runs {
         let end = at.checked_add(run.bytes as usize)?;
-        if text_cells(row.text.get(at..end)?) != u32::from(run.cells) {
+        let text = row.text.get(at..end)?;
+        let (counted, run_ascii) = text_cells(text);
+        if counted != u32::from(run.cells) {
             return None;
         }
+        // A leading empty run is the style `Cells` reads for the *next* run's
+        // first column, which a walk indexed by byte cannot reproduce.
+        ascii &= run_ascii && !text.is_empty();
         cells = cells.checked_add(run.cells)?;
         at = end;
     }
@@ -1428,7 +1610,14 @@ fn painted_cells(row: &RowFrame) -> Option<u16> {
         return None;
     }
     let cells = cells.checked_add(u16::try_from(tail.len()).ok()?)?;
-    (cells <= row.cells).then_some(cells)
+    if cells > row.cells {
+        return None;
+    }
+    Some(if ascii {
+        Painted::Ascii(AsciiCells(cells))
+    } else {
+        Painted::Measured(cells)
+    })
 }
 
 /// Only built for a row [`painted_cells`] agreed with, so its columns are the
@@ -1881,7 +2070,7 @@ mod tests {
 
     /// A row too wide for one datagram: `runs` style runs of ten columns each.
     /// One style throughout, so a joined row that lost or reordered a chunk
-    /// cannot look contiguous; true colour because only a twenty-byte run
+    /// cannot look contiguous; true colour because only an eighteen-byte run
     /// overruns a piece at these widths.
     fn wide_row(runs: usize) -> RowFrame {
         let mut text = String::with_capacity(runs * 10);
@@ -3051,7 +3240,7 @@ mod tests {
     fn a_chunked_row_wider_than_the_grid_is_dropped_and_never_acknowledged() {
         let size = GridSize { cols: 400, rows: 2 };
         // Six hundred columns against a four-hundred-column grid, cut into
-        // chunks of 370 and 230: every chunk passes, their sum does not.
+        // chunks of 390 and 210: every chunk passes, their sum does not.
         let wide = wide_row(60);
         let pieces = cut(&header(size), &[plain("aaaa"), wide.clone()]);
         assert!(pieces.len() >= 3, "the row was not cut");
@@ -3181,6 +3370,149 @@ mod tests {
             "the fourth wide glyph is column seven, not column four, and it is \
              the only cell written"
         );
+    }
+
+    /// Which walk a pair of rows is entitled to. A case that quietly stopped
+    /// taking the fast one would make the comparison below vacuous.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Branch {
+        Ascii,
+        Measured,
+        Whole,
+    }
+
+    fn framed(text: &str, cells: u16, runs: Vec<StyleRun>) -> RowFrame {
+        RowFrame {
+            text: text.into(),
+            runs,
+            cells,
+        }
+    }
+
+    /// Row pairs whose diff both walks owe the same answer for.
+    fn diff_corpus() -> Vec<(Branch, RowFrame, RowFrame)> {
+        let bare = CellStyle::default();
+        let zwj = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        vec![
+            (Branch::Ascii, plain("abcdefgh"), plain("abcdefgh")),
+            (Branch::Ascii, plain("abcdefgh"), plain("abXdefgh")),
+            (Branch::Ascii, plain("abcdefgh"), plain("Xbcdefgh")),
+            // Identical text, style boundary moved: no byte compare finds this.
+            (
+                Branch::Ascii,
+                styled("abcdefgh", 8, (4, 4)),
+                styled("abcdefgh", 8, (6, 6)),
+            ),
+            (
+                Branch::Ascii,
+                styled("abcdefgh", 8, (4, 4)),
+                styled("abXdefgh", 8, (5, 5)),
+            ),
+            // Two style disagreements with an agreeing interval between them.
+            (
+                Branch::Ascii,
+                framed(
+                    "abcdefgh",
+                    8,
+                    vec![run(2, 2, red()), run(3, 3, bare), run(3, 3, red())],
+                ),
+                framed("abcdefgh", 8, vec![run(4, 4, red()), run(4, 4, bare)]),
+            ),
+            // Runs split differently over one style: nothing to paint.
+            (
+                Branch::Ascii,
+                framed("abcdefgh", 8, vec![run(8, 8, red())]),
+                framed("abcdefgh", 8, vec![run(3, 3, red()), run(5, 5, red())]),
+            ),
+            (Branch::Ascii, plain("abcdefgh"), trimmed("abc", 8)),
+            (Branch::Ascii, trimmed("abc", 8), plain("abcdefgh")),
+            (
+                Branch::Ascii,
+                framed("hihihihi", 8, vec![run(8, 8, red())]),
+                framed("hi", 8, vec![run(2, 2, red())]),
+            ),
+            // The blanks a shortened row is short by, held as a styled run.
+            (
+                Branch::Ascii,
+                framed("ab  ", 8, vec![run(4, 4, bare)]),
+                plain("ab"),
+            ),
+            (Branch::Ascii, trimmed("ab  ef", 8), plain("ab")),
+            (Branch::Ascii, trimmed("ab  ", 8), trimmed("ab", 8)),
+            (
+                Branch::Measured,
+                framed(
+                    "\u{4f60}\u{597d}\u{4e16}\u{754c}tail",
+                    12,
+                    vec![run(8, 12, red())],
+                ),
+                framed(
+                    "\u{4f60}\u{597d}\u{4e16}\u{583a}tail",
+                    12,
+                    vec![run(8, 12, red())],
+                ),
+            ),
+            (
+                Branch::Measured,
+                framed("e\u{0301}xy", 8, vec![run(3, 5, red())]),
+                framed("e\u{0301}Xy", 8, vec![run(3, 5, red())]),
+            ),
+            // One side is ASCII and the other is not: still not a byte apiece.
+            (
+                Branch::Measured,
+                framed("e\u{0301}xy", 8, vec![run(3, 5, red())]),
+                framed("exy", 8, vec![run(3, 3, red())]),
+            ),
+            (
+                Branch::Measured,
+                framed("\u{1f600}ab", 8, vec![run(4, 6, red())]),
+                framed("\u{1f600}aX", 8, vec![run(4, 6, red())]),
+            ),
+            // Six columns here and two to libghostty: no column is placeable.
+            (
+                Branch::Whole,
+                framed(zwj, 8, vec![run(2, 18, red())]),
+                framed(
+                    &format!("{}\u{1f466}", &zwj[..14]),
+                    8,
+                    vec![run(2, 18, red())],
+                ),
+            ),
+        ]
+    }
+
+    /// The fast path is only allowed to exist because it answers what the
+    /// measured walk answers. `unicode-width` reads a ZWJ family as three
+    /// leading characters where libghostty reads one cell, so the corpus runs
+    /// the rows that prove a column is a byte beside the ones that disprove it.
+    #[test]
+    fn the_ascii_row_diff_answers_exactly_what_the_measured_walk_answers() {
+        for (branch, old, new) in diff_corpus() {
+            for clear_tail in [false, true] {
+                let patch = row_patch(&old, &new, clear_tail);
+                let (Some(was), Some(now)) = (painted_cells(&old), painted_cells(&new)) else {
+                    assert_eq!(branch, Branch::Whole, "{old:?} against {new:?}");
+                    assert_eq!(
+                        patch,
+                        Patch::Whole,
+                        "a row no column can be placed on is repainted whole"
+                    );
+                    continue;
+                };
+                let took = if matches!((was, now), (Painted::Ascii(_), Painted::Ascii(_))) {
+                    Branch::Ascii
+                } else {
+                    Branch::Measured
+                };
+                assert_eq!(took, branch, "{old:?} against {new:?} took the other walk");
+                let erase = clear_tail || was.cells() > now.cells();
+                assert_eq!(
+                    patch,
+                    measured_patch(&old, &new, erase),
+                    "{old:?} against {new:?}, clear_tail {clear_tail}"
+                );
+            }
+        }
     }
 
     /// A screen cannot restate an OSC, so the ones the byte stream carried ride

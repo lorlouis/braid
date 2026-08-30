@@ -2,8 +2,9 @@
 
 //! The datagram's outermost decoder, and the only one that allocates from a
 //! length it is not told: deflate carries no size on the wire, so the ceiling
-//! has to be applied to the buffer instead. Anything at all may be handed to
-//! `unpack` without a panic, and whatever `pack` produced comes back exactly.
+//! has to be applied to the slice the decompressor is handed instead. Anything
+//! at all may be handed to `unpack` without a panic, and whatever `pack`
+//! produced comes back exactly.
 
 use braid_proto::wire::{pack, unpack};
 use libfuzzer_sys::fuzz_target;
@@ -31,19 +32,21 @@ fuzz_target!(|data: &[u8]| {
             data.len(),
             packed.len()
         );
-        let mut back = Vec::new();
-        unpack(&packed, LIMIT, &mut back).expect("a payload this side packed");
+        let mut scratch = Vec::new();
+        let back = unpack(&packed, LIMIT, &mut scratch).expect("a payload this side packed");
         assert_eq!(back, data, "the codec is not its own inverse");
     }
 
-    // Both buffers are caller-owned and reused per datagram, so a decoder that
-    // appends rather than replaces corrupts under load and passes every
-    // single-shot test.
-    let mut reused = vec![0xAB; 4096];
-    let _ = unpack(data, LIMIT, &mut reused);
-    let mut fresh = Vec::new();
-    let first = unpack(data, LIMIT, &mut fresh);
-    if first.is_ok() {
-        assert_eq!(reused, fresh, "unpack depends on the buffer it was given");
-    }
+    // The answer is borrowed from the datagram or from the scratch, and the
+    // scratch is caller-owned and reused per datagram: a decoder that appends
+    // rather than replaces, or that answers out of whatever the last frame
+    // left behind, corrupts under load and passes every single-shot test.
+    let mut warm = vec![0xAB; 4096];
+    let warm_answer = unpack(data, LIMIT, &mut warm).ok().map(<[u8]>::to_vec);
+    let mut cold = Vec::new();
+    let cold_answer = unpack(data, LIMIT, &mut cold).ok().map(<[u8]>::to_vec);
+    assert_eq!(
+        warm_answer, cold_answer,
+        "unpack depends on the buffer it was given"
+    );
 });

@@ -5,7 +5,7 @@
 //! because a loss-based controller alone fills the path's buffer before it
 //! learns anything. Nothing here reads a clock; every method takes the time.
 
-use crate::loss::{MAX_TRACKED, Rtt, micros};
+use crate::loss::{Limited, MAX_TRACKED, Rtt, micros};
 use std::time::{Duration, Instant};
 
 /// Datagrams the window starts at, RFC 9002's initial window.
@@ -206,24 +206,46 @@ impl Congestion {
         )
     }
 
-    pub fn sealed(&mut self, bytes: usize, now: Instant) {
+    /// RFC 9002 §7.8 grows a window only for a sender the window is what
+    /// stopped, and only this moment knows which that was; the caller carries
+    /// the answer on the flight record.
+    #[must_use]
+    pub fn sealed(&mut self, bytes: usize, now: Instant) -> Limited {
+        let limited = if self.in_flight + bytes + self.datagram <= self.window {
+            Limited::Application
+        } else {
+            Limited::Window
+        };
         self.in_flight += bytes;
         let (window, burst) = (self.window, self.burst());
         self.pacer.spend(bytes, now, window, burst, self.srtt);
+        limited
     }
 
     /// One packet arrived, having been sealed at `sent`.
-    pub fn acknowledged(&mut self, bytes: usize, sent: Instant, rtt: &Rtt) {
+    pub fn acknowledged(&mut self, bytes: usize, sent: Instant, rtt: &Rtt, limited: Limited) {
         self.in_flight = self.in_flight.saturating_sub(bytes);
         self.srtt = rtt.smoothed();
         // The next loss is news, not an echo of the flight already in the air.
         if self.recovery_start.is_some_and(|start| sent > start) {
             self.recovery_start = None;
         }
+        // A delay measurement, not a window one: `overshoot` counts *consecutive*
+        // samples above the trigger, so skipping it while application-limited
+        // would let a run built during a bulk burst survive an interactive spell
+        // in which the bottleneck queue actually drained.
+        if self.window < self.ssthresh {
+            self.check_overshoot(rtt);
+        }
+        // A window an interactive session never filled has not been shown to be
+        // too small, and one grown on its keystrokes is a burst the pacer then
+        // releases at line rate into the first repaint. RFC 9002 §7.8.
+        if limited == Limited::Application {
+            return;
+        }
         let ceiling = self.ceiling();
         if self.window < self.ssthresh {
             self.window = (self.window + bytes).min(ceiling);
-            self.check_overshoot(rtt);
             return;
         }
         // One datagram per window acknowledged, in bytes so it needs no mark.
@@ -272,13 +294,17 @@ impl Congestion {
         self.pacer = Pacer::new();
     }
 
-    /// The same news as a loss, one bottleneck buffer earlier.
+    /// The same news as a loss, one bottleneck buffer earlier. Read off the
+    /// ack-delay-adjusted pair: the minimum is captured during the opening
+    /// burst, which the peer answers at once, so against raw samples the peer's
+    /// own ack timer reads as this path's queue and three keystrokes end slow
+    /// start on a path nothing is queued on.
     fn check_overshoot(&mut self, rtt: &Rtt) {
-        let Some(minimum) = rtt.minimum() else {
+        let Some(minimum) = rtt.minimum_adjusted() else {
             return;
         };
         let trigger = minimum + (minimum / 8).max(OVERSHOOT_FLOOR);
-        if rtt.latest() <= trigger {
+        if rtt.latest_adjusted() <= trigger {
             self.overshoot = 0;
             return;
         }
@@ -313,7 +339,7 @@ mod tests {
         assert_eq!(congestion.window(), 10 * MSS);
         let rtt = rtt(50);
         for _ in 0..10 {
-            congestion.acknowledged(MSS, now, &rtt);
+            congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         }
         assert_eq!(congestion.window(), 20 * MSS, "slow start doubles");
     }
@@ -322,19 +348,19 @@ mod tests {
     fn a_loss_halves_the_window_leaves_slow_start_and_stops_at_the_floor() {
         let mut congestion = Congestion::new(MSS);
         let mut now = Instant::now();
-        congestion.sealed(MSS, now);
+        let _ = congestion.sealed(MSS, now);
         congestion.lost(MSS, now, now);
         assert_eq!(congestion.window(), 5 * MSS);
         assert_eq!(congestion.in_flight(), 0);
         // A whole window of acks buys one datagram, not another window.
         let rtt = rtt(50);
         for _ in 0..5 {
-            congestion.acknowledged(MSS, now + Duration::from_millis(100), &rtt);
+            congestion.acknowledged(MSS, now + Duration::from_millis(100), &rtt, Limited::Window);
         }
         assert_eq!(congestion.window(), 6 * MSS);
         // And no run of signals takes it below the floor.
         for _ in 0..20 {
-            congestion.sealed(MSS, now);
+            let _ = congestion.sealed(MSS, now);
             congestion.lost(MSS, now, now);
             now += Duration::from_secs(1);
         }
@@ -347,7 +373,7 @@ mod tests {
         let mut congestion = Congestion::new(MSS);
         let now = Instant::now();
         for _ in 0..10 {
-            congestion.sealed(MSS, now);
+            let _ = congestion.sealed(MSS, now);
         }
         for _ in 0..9 {
             congestion.lost(MSS, now, now + Duration::from_millis(100));
@@ -355,7 +381,7 @@ mod tests {
         assert_eq!(congestion.window(), 5 * MSS, "one signal, one halving");
 
         let later = now + Duration::from_millis(200);
-        congestion.sealed(MSS, later);
+        let _ = congestion.sealed(MSS, later);
         congestion.lost(MSS, later, later);
         assert_eq!(congestion.window(), 2 * MSS + MSS / 2);
     }
@@ -366,16 +392,16 @@ mod tests {
         let mut congestion = Congestion::new(MSS);
         let now = Instant::now();
         let rtt = rtt(100);
-        congestion.acknowledged(0, now, &rtt);
+        congestion.acknowledged(0, now, &rtt, Limited::Window);
         let mut sent = 0;
         while congestion.writable(now, MSS) {
-            congestion.sealed(MSS, now);
+            let _ = congestion.sealed(MSS, now);
             sent += 1;
         }
         assert_eq!(sent, 10, "the burst is ten datagrams, not the window");
         let ready = congestion.ready(now, MSS);
         assert_eq!(ready, None, "the window is full, and only an ack opens it");
-        congestion.acknowledged(MSS, now, &rtt);
+        congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         let ready = congestion.ready(now, MSS).expect("the window has room");
         assert!(ready > now, "and the pacer holds it back");
         assert!(
@@ -392,7 +418,7 @@ mod tests {
         let mut congestion = Congestion::new(MSS);
         let now = Instant::now();
         for _ in 0..10 {
-            congestion.sealed(MSS, now);
+            let _ = congestion.sealed(MSS, now);
         }
         congestion.abandoned(10 * MSS);
         assert!(!congestion.writable(now, MSS));
@@ -405,16 +431,16 @@ mod tests {
         let mut congestion = Congestion::new(MSS);
         let now = Instant::now();
         let mut rtt = rtt(100);
-        congestion.acknowledged(MSS, now, &rtt);
+        congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         let doubling = congestion.window();
         for _ in 0..OVERSHOOT_SAMPLES {
             rtt.sample(Duration::from_millis(300), Duration::ZERO);
-            congestion.acknowledged(MSS, now, &rtt);
+            congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         }
         let stopped = congestion.window();
         for _ in 0..20 {
             rtt.sample(Duration::from_millis(300), Duration::ZERO);
-            congestion.acknowledged(MSS, now, &rtt);
+            congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         }
         assert!(doubling < stopped);
         assert!(
@@ -430,7 +456,7 @@ mod tests {
         let now = Instant::now();
         let rtt = rtt(20);
         for _ in 0..40 {
-            congestion.acknowledged(MSS, now, &rtt);
+            congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         }
         assert!(congestion.window() > 10 * MSS);
         congestion.collapse(now);
@@ -458,15 +484,80 @@ mod tests {
         let now = Instant::now();
         let rtt = rtt(1);
         for _ in 0..(MAX_DATAGRAMS * 4) {
-            congestion.acknowledged(MSS, now, &rtt);
+            congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         }
         assert_eq!(congestion.window(), MAX_DATAGRAMS * MSS);
         // The ceiling does not depend on which growth path the window is on.
         congestion.lost(0, now, now);
         for _ in 0..(MAX_DATAGRAMS * 4) {
             let full = congestion.window();
-            congestion.acknowledged(full, now, &rtt);
+            congestion.acknowledged(full, now, &rtt, Limited::Window);
         }
         assert_eq!(congestion.window(), MAX_DATAGRAMS * MSS);
+    }
+
+    /// RFC 9002 §7.8. An interactive session never puts more than a keystroke
+    /// in the air, so a window grown on its acknowledgements measures nothing
+    /// but the session's own patience — and the pacer then hands the whole of
+    /// it to the first repaint at line rate.
+    #[test]
+    fn a_sender_the_window_never_held_back_does_not_grow_it() {
+        let mut congestion = Congestion::new(MSS);
+        let mut now = Instant::now();
+        let rtt = rtt(50);
+        let opened = congestion.window();
+        for _ in 0..1_000 {
+            let limited = congestion.sealed(64, now);
+            assert_eq!(
+                limited,
+                Limited::Application,
+                "a keystroke cannot fill a window"
+            );
+            now += Duration::from_millis(50);
+            congestion.acknowledged(64, now, &rtt, limited);
+        }
+        assert_eq!(congestion.window(), opened);
+        assert_eq!(congestion.in_flight(), 0, "the bookkeeping still ran");
+    }
+
+    /// The minimum is taken during the opening burst, which the peer answers at
+    /// once; every interactive sample after it carries the peer's whole ack
+    /// timer. Compared raw, three keystrokes pin `ssthresh` for the connection's
+    /// life, since only the slow-start branch can ever raise it again.
+    #[test]
+    fn the_peers_own_acknowledgement_timer_does_not_end_slow_start() {
+        let path = Duration::from_millis(30);
+        let held = Duration::from_millis(25);
+        let samples = usize::try_from(OVERSHOOT_SAMPLES * 4).expect("a small count");
+        let now = Instant::now();
+
+        let mut congestion = Congestion::new(MSS);
+        let mut rtt = Rtt::default();
+        rtt.sample(path, Duration::ZERO);
+        congestion.acknowledged(MSS, now, &rtt, Limited::Window);
+        let opened = congestion.window();
+        for _ in 0..samples {
+            rtt.sample(path + held, held);
+            congestion.acknowledged(MSS, now, &rtt, Limited::Window);
+        }
+        assert_eq!(
+            congestion.window(),
+            opened + samples * MSS,
+            "the path never queued a byte"
+        );
+
+        // The same spread, with the peer admitting to none of it.
+        let mut congestion = Congestion::new(MSS);
+        let mut rtt = Rtt::default();
+        rtt.sample(path, Duration::ZERO);
+        congestion.acknowledged(MSS, now, &rtt, Limited::Window);
+        for _ in 0..samples {
+            rtt.sample(path + held, Duration::ZERO);
+            congestion.acknowledged(MSS, now, &rtt, Limited::Window);
+        }
+        assert!(
+            congestion.window() < opened + samples * MSS,
+            "an unexplained climb is still the bottleneck buffer filling"
+        );
     }
 }

@@ -8,7 +8,7 @@ use braid_proto::{
     Generation, ResumeRequest, SessionId, VersionRange,
 };
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -103,8 +103,10 @@ pub(crate) fn reconnect_path(destination: &str) -> Option<PathBuf> {
 /// Create `<root>/brd/reconnect` as directories only this user can reach.
 ///
 /// The two components holding capabilities are created *with* their mode; a
-/// `create_dir_all` then `chmod` leaves a window.
-fn private_state_dir(directory: &Path) -> io::Result<()> {
+/// `create_dir_all` then `chmod` leaves a window. Called before the tree is
+/// *read* as well as before it is written: this one repairs a permissive
+/// directory rather than refusing it, so permissive trees are expected here.
+pub(crate) fn private_state_dir(directory: &Path) -> io::Result<()> {
     let brd = directory
         .parent()
         .ok_or_else(|| io::Error::other("state directory has no parent"))?;
@@ -191,11 +193,26 @@ pub(crate) fn save_sessions(path: &Path, sessions: &[ReconnectState]) -> io::Res
 }
 
 pub(crate) fn load_sessions(path: &Path) -> io::Result<Vec<ReconnectState>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
+    // The 0600 the write path creates this with, checked off the descriptor
+    // rather than the path so that what was checked is exactly what is read.
+    // Refusing rather than erroring: a capability another user can write is no
+    // session to resume, and it is not a reason to refuse to start one.
+    let meta = file.metadata()?;
+    if meta.uid() != rustix::process::getuid().as_raw() || meta.permissions().mode() & 0o077 != 0 {
+        eprintln!(
+            "[brd] ignoring resume state at {}: it is not private to this user",
+            path.display()
+        );
+        return Ok(Vec::new());
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
     // Written by rename, so a partial record is a foreign or older format
     // rather than a torn write: there is no session to resume in it.
     if bytes.len() % STATE_RECORD != 0 {

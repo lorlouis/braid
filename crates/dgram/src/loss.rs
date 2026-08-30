@@ -19,11 +19,18 @@ const INITIAL_RTT: Duration = Duration::from_millis(333);
 /// So a link measured in microseconds does not declare loss on scheduler jitter.
 const MIN_LOSS_DELAY: Duration = Duration::from_millis(1);
 
+/// RFC 9002 §6.2.1's `kGranularity`, and not decoration: `rttvar` collapses to
+/// zero on a link with no jitter — a LAN, a container, loopback, a simulator —
+/// and without a floor the probe timeout becomes exactly `srtt + MAX_ACK_DELAY`,
+/// which is exactly when an acknowledgement the peer held for its full timer
+/// arrives. Every such packet times out one instant before its own ack.
+const TIMER_GRANULARITY: u64 = 1_000;
+
 /// The peer adds this to its probe timeout, so a delayed ack is not a loss.
 pub const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 
-/// So a peer that acknowledges nothing cannot grow this side's memory. The
-/// oldest are abandoned, not lost.
+/// So a peer that acknowledges nothing cannot grow this side's memory. The oldest leave
+/// as [`Cause::Overflowed`], not lost.
 pub(crate) const MAX_TRACKED: usize = 4096;
 
 /// Two, because one timeout is a burst.
@@ -37,18 +44,20 @@ const MAX_PTO_BACKOFF: u32 = 6;
 pub struct Rtt {
     smoothed: Option<u64>,
     var: u64,
-    latest: u64,
-    min: Option<u64>,
+    /// The latest sample and the minimum with the peer's admitted delay taken off,
+    /// which is what a trigger comparing one sample against another has to read.
+    latest_adjusted: u64,
+    min_adjusted: Option<u64>,
 }
 
 impl Rtt {
     /// `delay` is what the peer admits to holding it, and comes off the top.
     pub fn sample(&mut self, taken: Duration, delay: Duration) {
         let taken = micros(taken);
-        self.latest = taken;
-        self.min = Some(self.min.map_or(taken, |min| min.min(taken)));
         // Never to zero, or a peer claiming a negative trip pins the loss delay.
         let adjusted = taken.saturating_sub(micros(delay)).max(1);
+        self.latest_adjusted = adjusted;
+        self.min_adjusted = Some(self.min_adjusted.map_or(adjusted, |min| min.min(adjusted)));
         let Some(smoothed) = self.smoothed else {
             self.smoothed = Some(adjusted);
             self.var = adjusted / 2;
@@ -69,23 +78,38 @@ impl Rtt {
         Duration::from_micros(self.var)
     }
 
+    /// Adjusted rather than raw because a *delay* trigger compares one sample
+    /// against another: the minimum is captured during the opening burst, which
+    /// the peer answers at once, so against raw samples the peer's own ack timer
+    /// reads as this path's queue.
     #[must_use]
-    pub const fn latest(&self) -> Duration {
-        Duration::from_micros(self.latest)
+    pub const fn latest_adjusted(&self) -> Duration {
+        Duration::from_micros(self.latest_adjusted)
     }
 
     /// The closest thing to the path's propagation delay with no queue in it.
     #[must_use]
-    pub fn minimum(&self) -> Option<Duration> {
-        self.min.map(Duration::from_micros)
+    pub fn minimum_adjusted(&self) -> Option<Duration> {
+        self.min_adjusted.map(Duration::from_micros)
     }
 
     /// How long a packet may go unacknowledged, with later ones acknowledged.
+    /// RFC 9002 §6.1.2's `latest_rtt` term is what keeps a delay spike from
+    /// reading as loss: the smoothed estimate lags one by eight samples, and a
+    /// flight merely late would halve the window and feed the black-hole
+    /// counter, so one handover would read as congestion *and* a narrowing path.
+    ///
+    /// Adjusted, unlike the RFC's: `MAX_ACK_DELAY` here is 25 ms against paths
+    /// of a few tens, so a raw `latest` carries the peer's own ack timer into a
+    /// threshold that is supposed to describe the path. Left raw, a real black
+    /// hole stays "not lost yet" long enough that the MTU search never reaches
+    /// `PMTU_BLACKHOLE_LOSSES` and the session sits on a width nothing carries
+    /// — `a_path_that_stops_carrying_full_size_datagrams_falls_back_and_recovers`.
     #[must_use]
     pub fn loss_delay(&self) -> Duration {
-        let base = self
-            .smoothed
-            .map_or(micros(INITIAL_RTT), |smoothed| smoothed.max(self.var));
+        let base = self.smoothed.map_or(micros(INITIAL_RTT), |smoothed| {
+            smoothed.max(self.latest_adjusted).max(self.var)
+        });
         Duration::from_micros(base * 9 / 8).max(MIN_LOSS_DELAY)
     }
 
@@ -93,8 +117,19 @@ impl Rtt {
     #[must_use]
     pub fn probe_timeout(&self) -> Duration {
         let smoothed = self.smoothed.unwrap_or(micros(INITIAL_RTT));
-        Duration::from_micros(smoothed + 4 * self.var) + MAX_ACK_DELAY
+        Duration::from_micros(smoothed + (4 * self.var).max(TIMER_GRANULARITY)) + MAX_ACK_DELAY
     }
+}
+
+/// What stopped the sender at the moment a packet was sealed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limited {
+    /// The window still had room for another datagram behind it, so RFC 9002
+    /// §7.8 has no evidence here that the window is too small.
+    Application,
+    /// The window is what refused the next one, so this one arriving is
+    /// evidence the window may grow.
+    Window,
 }
 
 /// No epoch: numbers ascend for the connection's life, so one names one packet.
@@ -103,6 +138,8 @@ pub struct InFlight {
     pub number: u64,
     pub bytes: usize,
     pub sent: Instant,
+    /// Carried rather than recomputed: only the moment of sealing knows.
+    pub limited: Limited,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,14 +147,24 @@ pub struct Arrived {
     pub number: u64,
     pub bytes: usize,
     pub sent: Instant,
+    pub limited: Limited,
 }
 
+/// Why a packet left the flight without being acknowledged.
+///
+/// Silence and overflow are separated because they are different facts about
+/// the path: one datagram nobody mentioned while the window sat at its minimum
+/// is the shape a black hole has, and four thousand forgotten under a flood is
+/// the shape a loopback has. Collapsed into one variant, the MTU search either
+/// believes the flood or misses the tunnel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cause {
     /// The peer acknowledged packets around it. Evidence of congestion.
     Lost,
-    /// Nothing was ever said about it. Evidence of nothing, until it repeats.
-    Abandoned,
+    /// The probe timer ran out and nothing was ever said about it.
+    Silent,
+    /// The flight table filled, so nothing is known about it either way.
+    Overflowed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,8 +221,8 @@ impl LossDetector {
             rtt: Rtt {
                 smoothed: None,
                 var: 0,
-                latest: 0,
-                min: None,
+                latest_adjusted: 0,
+                min_adjusted: None,
             },
             largest_acked: None,
             arrived: Vec::new(),
@@ -225,9 +272,17 @@ impl LossDetector {
     }
 
     /// Nothing measured on the old path is evidence about this one (RFC 9002 §5.5).
+    ///
+    /// The flight itself stays — those datagrams are still outstanding and still
+    /// charged to the window — but the watermark the packet threshold reads and
+    /// the register of what the old path wrote off both describe a path this
+    /// connection has left, and a late acknowledgement for one of them is not
+    /// this path's impatience.
     pub fn migrated(&mut self) {
         self.rtt = Rtt::default();
         self.silence = 0;
+        self.largest_acked = None;
+        self.written_off.clear();
     }
 
     #[must_use]
@@ -259,7 +314,7 @@ impl LossDetector {
         while self.sent.len() > MAX_TRACKED
             && let Some(oldest) = self.sent.pop_front()
         {
-            self.retire(oldest, Cause::Abandoned);
+            self.retire(oldest, Cause::Overflowed);
         }
     }
 
@@ -274,15 +329,19 @@ impl LossDetector {
                 .map_or(ack.largest, |seen| seen.max(ack.largest)),
         );
         let mut sample = None;
-        // Backwards: [`covers`] only names `largest - 64 ..= largest` and the
-        // flight ascends, so the scan stops early and pops off the end.
-        let mut index = self.sent.len();
-        while index > 0 {
+        // [`covers`] names `largest - 64 ..= largest` and nothing else, and the
+        // flight ascends by number, so the two bounds are where the scan can
+        // find anything at all. Walked backwards inside them because removal
+        // shifts everything after the index and nothing before it.
+        let end = self
+            .sent
+            .partition_point(|packet| packet.number <= ack.largest);
+        let floor = ack.largest.saturating_sub(64);
+        let start = self.sent.partition_point(|packet| packet.number < floor);
+        let mut index = end;
+        while index > start {
             index -= 1;
             let packet = self.sent[index];
-            if packet.number + 64 < ack.largest {
-                break;
-            }
             if !covers(ack, packet.number) {
                 continue;
             }
@@ -294,6 +353,7 @@ impl LossDetector {
                 number: packet.number,
                 bytes: packet.bytes,
                 sent: packet.sent,
+                limited: packet.limited,
             });
         }
         // The MTU search reads this in packet order to decide a black hole.
@@ -343,7 +403,7 @@ impl LossDetector {
                 Cause::Lost
             } else if age >= probe_timeout {
                 abandoned = true;
-                Cause::Abandoned
+                Cause::Silent
             } else {
                 break;
             };
@@ -417,12 +477,14 @@ pub(crate) fn micros(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn flight(number: u64, sent: Instant) -> InFlight {
         InFlight {
             number,
             bytes: 1200,
             sent,
+            limited: Limited::Window,
         }
     }
 
@@ -516,7 +578,7 @@ mod tests {
         assert!(detector.gone().is_empty());
         detector.expire(now + Duration::from_secs(3));
         assert_eq!(detector.gone().len(), 10);
-        assert!(detector.gone().iter().all(|g| g.cause == Cause::Abandoned));
+        assert!(detector.gone().iter().all(|g| g.cause == Cause::Silent));
         assert_eq!(detector.losses(), 0, "silence is not congestion");
         assert_eq!(detector.silence(), 1);
         assert_eq!(detector.tracked(), 0);
@@ -675,10 +737,98 @@ mod tests {
         let now = Instant::now();
         detector.sealed(flight(0, now));
         detector.acknowledged(ack(0, 0), now + Duration::from_millis(5));
-        assert_eq!(detector.rtt().minimum(), Some(Duration::from_millis(5)));
+        assert_eq!(
+            detector.rtt().minimum_adjusted(),
+            Some(Duration::from_millis(5))
+        );
         detector.migrated();
-        assert_eq!(detector.rtt().minimum(), None);
+        assert_eq!(detector.rtt().minimum_adjusted(), None);
         assert_eq!(detector.rtt().smoothed(), None);
         assert_eq!(detector.silence(), 0);
+    }
+
+    /// RFC 9002 §6.1.2's `latest_rtt` term. A handover moves everything already
+    /// in the air at once and the smoothed estimate needs eight samples to
+    /// follow, so without it a flight merely late is declared lost — halving the
+    /// window and feeding the black-hole counter off one delay spike.
+    #[test]
+    fn a_step_increase_in_the_round_trip_does_not_declare_the_flight_lost() {
+        let mut detector = LossDetector::new();
+        let mut now = Instant::now();
+        for number in 0..20u64 {
+            detector.sealed(flight(number, now));
+            now += Duration::from_millis(20);
+            detector.acknowledged(ack(number, 0), now);
+        }
+        assert_eq!(detector.rtt().smoothed(), Some(Duration::from_millis(20)));
+
+        // Five times the path, for what is on it as well as what follows.
+        detector.sealed(flight(20, now));
+        detector.sealed(flight(21, now));
+        now += Duration::from_millis(100);
+        detector.acknowledged(ack(21, 0), now);
+        assert_eq!(
+            detector.gone(),
+            [],
+            "still inside the delay this very acknowledgement measured"
+        );
+    }
+
+    /// Differential test against a scan of the whole flight: the bound is only
+    /// sound because [`covers`] names `largest - 64 ..= largest`, and an unbounded
+    /// scan walks every packet sealed after the acknowledgement — a round trip of
+    /// sends per ack.
+    #[test]
+    fn the_bounded_scan_retires_exactly_what_a_scan_of_the_whole_flight_would() {
+        // xorshift64*: reproducible without a dependency.
+        fn xorshift(state: &mut u64) -> u64 {
+            *state ^= *state >> 12;
+            *state ^= *state << 25;
+            *state ^= *state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        let mut detector = LossDetector::new();
+        let now = Instant::now();
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut outstanding: BTreeSet<u64> = BTreeSet::new();
+        let mut next = 0u64;
+        for _ in 0..2_000 {
+            for _ in 0..(xorshift(&mut state) % 40) {
+                if !detector.admits() {
+                    break;
+                }
+                detector.sealed(flight(next, now));
+                outstanding.insert(next);
+                next += 1;
+            }
+            let Some(&oldest) = outstanding.first() else {
+                continue;
+            };
+            // Anywhere in the flight, so packets sealed after it are the case
+            // the bound exists for.
+            let largest = oldest + xorshift(&mut state) % (next - oldest);
+            let map = xorshift(&mut state);
+            let ack = checked(Ack {
+                largest,
+                delay: Duration::ZERO,
+                map,
+            });
+            let whole: Vec<u64> = outstanding
+                .iter()
+                .copied()
+                .filter(|&number| covers(&ack.0, number))
+                .collect();
+            detector.acknowledged(ack, now);
+            let arrived: Vec<u64> = detector.arrived().iter().map(|a| a.number).collect();
+            assert_eq!(arrived, whole, "largest {largest}, map {map:#x}");
+            for number in &arrived {
+                outstanding.remove(number);
+            }
+            for gone in detector.gone() {
+                outstanding.remove(&gone.number);
+            }
+        }
+        assert!(next > 1_000, "the run sealed almost nothing: {next}");
     }
 }

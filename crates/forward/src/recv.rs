@@ -5,16 +5,22 @@
 //! memory.
 
 use crate::{
-    Ack, CHUNK_WINDOW, Contradiction, FORWARD_WINDOW, MAX_ACK_RUNS, MAX_HELD_SEGMENTS, SackRun,
-    SackRuns, as_len, as_off,
+    Ack, CHUNK_WINDOW, Contradiction, FORWARD_WINDOW, MAX_ACK_RUNS, MAX_FORWARD_CHUNK,
+    MAX_HELD_SEGMENTS, SackRun, SackRuns, as_len, as_off,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU32;
 
-struct Held {
-    bytes: Vec<u8>,
-    fin: bool,
-}
+/// Buffers kept for segments held past a gap, and the largest one kept. The
+/// held set reaches 256 segments of 32 KiB, so pooling every one would idle
+/// 8 MiB beside a 256 KiB window; four at a quarter-segment idle 32 KiB, which
+/// is one segment. The size bound is what holds it there: the gap a lost
+/// datagram opens is filled by segments cut to the datagram budget - 1138
+/// bytes on the link `tests/link.rs` drives - so a buffer grown to a whole
+/// stream-sized segment goes back rather than sit on 32 KiB awaiting a
+/// kilobyte.
+const SPARE_HELD: usize = 4;
+const SPARE_HELD_BYTES: usize = MAX_FORWARD_CHUNK / 4;
 
 pub(crate) struct Receiver {
     /// Once the peer's end has been placed this sits one past the offset that
@@ -22,11 +28,20 @@ pub(crate) struct Receiver {
     next: u64,
     ready: VecDeque<u8>,
     /// Segments past the gap at `next`, by offset.
-    held: BTreeMap<u64, Held>,
+    held: BTreeMap<u64, Vec<u8>>,
     held_bytes: usize,
+    /// Buffers of segments already placed, for the next segment held.
+    spare: Vec<Vec<u8>>,
     fin: Option<u64>,
     finished: bool,
     ack_owed: bool,
+    /// The runs of the last acknowledgement, kept for the next one: an
+    /// acknowledgement is owed once per arrival including a duplicate.
+    /// `SackRuns::from_slice` copies out of this, so what the retention saves is
+    /// not that copy but the accumulator's growth from zero — and the copy is
+    /// sized by the merged run count rather than by the held segments the merge
+    /// folded away.
+    runs: Vec<SackRun>,
 }
 
 impl Receiver {
@@ -36,9 +51,11 @@ impl Receiver {
             ready: VecDeque::new(),
             held: BTreeMap::new(),
             held_bytes: 0,
+            spare: Vec::new(),
             fin: None,
             finished: false,
             ack_owed: false,
+            runs: Vec::new(),
         }
     }
 
@@ -94,16 +111,20 @@ impl Receiver {
     /// Runs above the gap, measured from it outwards. Overlapping or abutting
     /// segments are merged, or a sender is told to leave a hole it has filled;
     /// the lowest runs win the cut, since they are repaired first.
-    fn held_runs(&self) -> SackRuns {
-        let mut runs = Vec::new();
-        let mut cursor = self.next;
+    fn held_runs(&mut self) -> SackRuns {
+        // Split so the walk over `held` and the refill of `runs` borrow apart.
+        let Self {
+            next, held, runs, ..
+        } = self;
+        runs.clear();
+        let mut cursor = *next;
         let mut open: Option<(u64, u64)> = None;
-        for (&off, held) in &self.held {
-            let end = off.saturating_add(as_off(held.bytes.len()));
+        for (&off, held) in &*held {
+            let end = off.saturating_add(as_off(held.len()));
             match open {
                 Some((start, seen)) if off <= seen => open = Some((start, seen.max(end))),
                 Some(run) => {
-                    push_run(&mut runs, &mut cursor, run);
+                    push_run(runs, &mut cursor, run);
                     open = Some((off, end));
                 }
                 None => open = Some((off, end)),
@@ -115,9 +136,9 @@ impl Receiver {
         if let Some(run) = open
             && runs.len() < MAX_ACK_RUNS
         {
-            push_run(&mut runs, &mut cursor, run);
+            push_run(runs, &mut cursor, run);
         }
-        SackRuns::new(runs).unwrap_or(SackRuns::EMPTY)
+        SackRuns::from_slice(runs).expect("the loop stops at MAX_ACK_RUNS")
     }
 
     pub(crate) fn on_data(
@@ -143,7 +164,7 @@ impl Receiver {
         self.ack_owed = true;
         if end > self.next {
             if off > self.next {
-                self.hold(off, bytes, fin);
+                self.hold(off, bytes);
             } else {
                 let fresh = &bytes[as_len(self.next - off)..];
                 // Moving `next` past bytes this side dropped would tell the
@@ -162,10 +183,10 @@ impl Receiver {
     fn held_past(&self, end: u64) -> bool {
         self.held
             .iter()
-            .any(|(off, held)| off.saturating_add(as_off(held.bytes.len())) > end)
+            .any(|(off, held)| off.saturating_add(as_off(held.len())) > end)
     }
 
-    fn hold(&mut self, off: u64, bytes: &[u8], fin: bool) {
+    fn hold(&mut self, off: u64, bytes: &[u8]) {
         // Refused rather than truncated: a segment stored short is one whose
         // offsets no longer describe its bytes.
         if bytes.is_empty()
@@ -175,16 +196,16 @@ impl Receiver {
         {
             return;
         }
-        let entry = self.held.entry(off).or_insert_with(|| Held {
-            bytes: Vec::new(),
-            fin: false,
-        });
-        if entry.bytes.len() < bytes.len() {
-            self.held_bytes = self.held_bytes + bytes.len() - entry.bytes.len();
-            entry.bytes.clear();
-            entry.bytes.extend_from_slice(bytes);
+        let spare = &mut self.spare;
+        let entry = self
+            .held
+            .entry(off)
+            .or_insert_with(|| spare.pop().unwrap_or_default());
+        if entry.len() < bytes.len() {
+            self.held_bytes = self.held_bytes + bytes.len() - entry.len();
+            entry.clear();
+            entry.extend_from_slice(bytes);
         }
-        entry.fin |= fin;
     }
 
     fn drain_held(&mut self) {
@@ -195,13 +216,23 @@ impl Receiver {
             let Some(held) = self.held.remove(&off) else {
                 break;
             };
-            self.held_bytes -= held.bytes.len();
-            let end = off.saturating_add(as_off(held.bytes.len()));
+            self.held_bytes -= held.len();
+            let end = off.saturating_add(as_off(held.len()));
             if end > self.next {
                 let skip = as_len(self.next - off);
-                self.ready.extend(&held.bytes[skip..]);
+                self.ready.extend(&held[skip..]);
                 self.next = end;
             }
+            self.recycle(held);
+        }
+    }
+
+    /// Cleared on the way in: a buffer handed back with its bytes still in it
+    /// would be read as a held segment already longer than what replaces it.
+    fn recycle(&mut self, mut buffer: Vec<u8>) {
+        if self.spare.len() < SPARE_HELD && buffer.capacity() <= SPARE_HELD_BYTES {
+            buffer.clear();
+            self.spare.push(buffer);
         }
     }
 
@@ -235,7 +266,6 @@ fn push_run(runs: &mut Vec<SackRun>, cursor: &mut u64, (start, end): (u64, u64))
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MAX_FORWARD_CHUNK;
 
     fn drained(receiver: &Receiver) -> Vec<u8> {
         let (front, back) = receiver.readable();
@@ -375,5 +405,71 @@ mod tests {
         let mut recv = Receiver::new();
         recv.on_data(10, false, b"held").expect("held");
         assert_eq!(recv.on_data(0, true, b"abc"), Err(Contradiction));
+    }
+
+    #[test]
+    fn a_reused_buffer_carries_none_of_the_segment_it_held() {
+        let mut recv = Receiver::new();
+        recv.on_data(3, false, b"defgh").expect("held");
+        recv.on_data(0, false, b"abc").expect("the gap");
+        assert_eq!(drained(&recv), b"abcdefgh");
+        assert_eq!(recv.spare.len(), 1, "a datagram-sized buffer is kept");
+        // Shorter than what the pooled buffer last held, which is the case a
+        // buffer handed back uncleared would silently refuse to store.
+        recv.on_data(9, false, b"j").expect("a second gap");
+        recv.on_data(8, false, b"i").expect("the second gap");
+        assert_eq!(drained(&recv), b"abcdefghij");
+        assert_eq!(recv.held_bytes, 0);
+    }
+
+    #[test]
+    fn a_whole_segment_buffer_is_dropped_rather_than_pooled() {
+        let mut recv = Receiver::new();
+        let bulk = vec![b'x'; MAX_FORWARD_CHUNK];
+        recv.on_data(1, false, &bulk).expect("past the gap");
+        recv.on_data(0, false, b"a").expect("the gap");
+        assert!(recv.held.is_empty());
+        assert!(
+            recv.spare.is_empty(),
+            "32 KiB idle against the next kilobyte costs more than the malloc"
+        );
+    }
+
+    #[test]
+    fn the_pool_of_spare_buffers_is_bounded() {
+        let mut recv = Receiver::new();
+        for slot in 1..=as_off(SPARE_HELD + 4) {
+            recv.on_data(slot, false, b"x").expect("past the gap");
+        }
+        recv.on_data(0, false, b"x").expect("the gap");
+        assert!(recv.held.is_empty());
+        assert_eq!(recv.spare.len(), SPARE_HELD, "idle capacity has a ceiling");
+    }
+
+    #[test]
+    fn the_run_buffer_stops_growing_once_an_acknowledgement_has_warmed_it() {
+        let mut recv = Receiver::new();
+        // Disjoint, so each one is a run of its own rather than a merge.
+        for slot in 1..=8 {
+            recv.on_data(slot * 10, false, b"held")
+                .expect("past the gap");
+        }
+        let ack = recv.poll_ack().expect("the first ack");
+        assert_eq!(ack.held.as_slice().len(), 8);
+        let warm = recv.runs.capacity();
+        for slot in 1..=8 {
+            recv.on_data(slot * 10, false, b"held").expect("a repeat");
+            let ack = recv.poll_ack().expect("owed once per arrival");
+            assert_eq!(
+                ack.held.as_slice().len(),
+                8,
+                "a refill that did not clear would stack the runs it already sent"
+            );
+            assert_eq!(
+                recv.runs.capacity(),
+                warm,
+                "one allocation, not one per ack"
+            );
+        }
     }
 }

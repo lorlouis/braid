@@ -229,8 +229,8 @@ fn carried(payload: &[u8], scratch: &mut Vec<u8>) -> Option<ServerMessage> {
     if is_message(payload) {
         return ServerMessage::decode(payload, Version::LOCAL).ok();
     }
-    unpack(payload, MAX_FRAME as usize, scratch).ok()?;
-    ServerMessage::decode(scratch, Version::LOCAL).ok()
+    let body = unpack(payload, MAX_FRAME as usize, scratch).ok()?;
+    ServerMessage::decode(body, Version::LOCAL).ok()
 }
 
 #[derive(Clone)]

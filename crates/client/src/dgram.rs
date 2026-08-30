@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! The datagram half of a session, once the offer has been taken up. One
 //! `braid` frame per datagram and nothing fragments: both ends size messages
@@ -19,7 +19,8 @@ use braid_proto::{DatagramOffer, DecodeError, MIN_DATAGRAM_FRAME};
 use rustix::net::RecvFlags;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::sync::{Arc, Mutex};
+use std::ops::Range;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,7 +40,10 @@ const _: () = assert!(
 /// networks and then stopped typing is never found again.
 const TRANSMIT_TICK: Duration = Duration::from_millis(250);
 
-/// The shortest that thread sleeps, so a deadline already past cannot spin it.
+/// A deadline the window refuses to clear — a probe the pacer will not admit
+/// names one and [`Endpoint::poll_transmit`] then emits nothing — is one
+/// already past on the next pass, so without a floor the thread spins on it.
+/// [`Clock::advance`] still reaches under this: it names the instant directly.
 const TICK_FLOOR: Duration = Duration::from_millis(1);
 
 /// The session ends the moment a `Close` or `Detach` is handed over, so one
@@ -67,6 +71,17 @@ fn widen_receive_buffer(socket: &UdpSocket) {
     let _ = rustix::net::sockopt::set_socket_recv_buffer_size(socket, RECEIVE_BUFFER);
 }
 
+/// Either family left fragmenting is enough: this socket reaches one peer.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn fragmenting() -> Fragmentation {
+    log!(
+        "this kernel would not stop fragmenting datagrams: this session stays at \
+         {BASE_DATAGRAM} bytes rather than settle above it on a path that only carries the \
+         probe in pieces"
+    );
+    Fragmentation::Permitted
+}
+
 /// Make the MTU search's answers mean something, by refusing to fragment.
 ///
 /// Otherwise the kernel answers for the path: the 4000- and 8900-byte probes
@@ -75,26 +90,69 @@ fn widen_receive_buffer(socket: &UdpSocket) {
 /// 1500-byte path, so one percent packet loss costs 6.8% of those datagrams.
 /// Reported rather than silently best-effort: the search reads the answer.
 #[cfg(target_os = "linux")]
-fn refuse_fragmentation(socket: &UdpSocket, local: SocketAddr) -> Fragmentation {
+fn refuse_fragmentation(socket: &UdpSocket) -> Fragmentation {
     use rustix::net::sockopt::{Ipv4PathMtuDiscovery, Ipv6PathMtuDiscovery};
-    // Whichever family the offer named: `IPV6_MTU_DISCOVER` is `ENOPROTOOPT`
-    // on a v4 socket, and this socket reaches exactly one peer.
-    let set = if local.is_ipv4() {
-        rustix::net::sockopt::set_ip_mtu_discover(socket, Ipv4PathMtuDiscovery::DO)
-    } else {
+    // The family the socket really has rather than the one the offer named:
+    // `IPV6_MTU_DISCOVER` is `ENOPROTOOPT` on a v4 socket, and this one
+    // reaches exactly one peer.
+    let set = if socket.local_addr().is_ok_and(|local| local.is_ipv6()) {
         rustix::net::sockopt::set_ipv6_mtu_discover(socket, Ipv6PathMtuDiscovery::DO)
+    } else {
+        rustix::net::sockopt::set_ip_mtu_discover(socket, Ipv4PathMtuDiscovery::DO)
     };
     if set.is_ok() {
-        Fragmentation::Refused
-    } else {
-        Fragmentation::Permitted
+        return Fragmentation::Refused;
     }
+    fragmenting()
 }
 
-/// `IP_DONTFRAG`/`IPV6_DONTFRAG` are what this is elsewhere and rustix exposes
-/// neither, so off Linux the search never leaves [`BASE_DATAGRAM`].
-#[cfg(not(target_os = "linux"))]
-fn refuse_fragmentation(_: &UdpSocket, _: SocketAddr) -> Fragmentation {
+/// The same on Darwin, where rustix exposes neither option. An oversize
+/// `sendto` then fails with `EMSGSIZE`, which [`path_refused`] already reads as
+/// a path that narrowed rather than as a socket that broke.
+#[cfg(target_vendor = "apple")]
+#[allow(
+    unsafe_code,
+    reason = "IP_DONTFRAG and IPV6_DONTFRAG have no safe binding"
+)]
+fn refuse_fragmentation(socket: &UdpSocket) -> Fragmentation {
+    use std::os::fd::AsRawFd;
+
+    /// Darwin's `netinet6/in6.h`; `libc` declares the v4 option only.
+    const IPV6_DONTFRAG: libc::c_int = 62;
+    /// Both options take one `c_int`, which is the length `setsockopt` is told.
+    const _: () = assert!(size_of::<libc::c_int>() == 4);
+
+    let (level, option) = if socket.local_addr().is_ok_and(|local| local.is_ipv6()) {
+        (libc::IPPROTO_IPV6, IPV6_DONTFRAG)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_DONTFRAG)
+    };
+    let on: libc::c_int = 1;
+    // SAFETY: `socket` owns the descriptor for the whole call, and `on` is
+    // live, correctly typed, and named at exactly its own length.
+    let set = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            option,
+            std::ptr::from_ref(&on).cast(),
+            4,
+        )
+    };
+    if set == 0 {
+        return Fragmentation::Refused;
+    }
+    fragmenting()
+}
+
+/// rustix exposes neither `IP_DONTFRAG` nor `IPV6_DONTFRAG`.
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn refuse_fragmentation(_: &UdpSocket) -> Fragmentation {
+    log!(
+        "datagram sockets here cannot be told to stop fragmenting, so this session stays at \
+         {BASE_DATAGRAM} bytes rather than settle above it on a path that only carries the \
+         probe in pieces"
+    );
     Fragmentation::Permitted
 }
 
@@ -103,6 +161,108 @@ fn refuse_fragmentation(_: &UdpSocket, _: SocketAddr) -> Fragmentation {
 /// spent, the loss detector reports it, and the MTU search narrows the path.
 fn path_refused(error: &io::Error) -> bool {
     error.raw_os_error() == Some(rustix::io::Errno::MSGSIZE.raw_os_error())
+}
+
+/// Tell the connection what the kernel says this path carries, rather than let
+/// the search spend three losses and two spaced probes — seconds of output down
+/// a black hole — rediscovering the width the ICMP behind this refusal already
+/// named. Only this side's own `sendto` reaches here and no arriving datagram
+/// does, so unlike a loss a forged packet cannot drive it.
+#[cfg(target_os = "linux")]
+fn narrowed(shared: &Mutex<Endpoint>, to: SocketAddr, now: Instant) {
+    let Some(carries) = path_mtu(to) else {
+        return;
+    };
+    if let Ok(mut endpoint) = shared.lock() {
+        endpoint.path_refused(carries, now);
+    }
+}
+
+/// What the route says a datagram to this peer may carry. The number is the
+/// route's rather than the socket's, and `IP_MTU` on the deliberately
+/// unconnected socket this link sends from is `ENOTCONN`, so a throwaway
+/// connected socket is what reads the very value the refused `sendto` was
+/// measured against: four syscalls, on a path taken once per narrowing.
+#[cfg(target_os = "linux")]
+fn path_mtu(to: SocketAddr) -> Option<usize> {
+    /// What the kernel's MTU counts and a datagram's own width does not.
+    const V4_HEADERS: usize = 20 + 8;
+    const V6_HEADERS: usize = 40 + 8;
+
+    let probe = match to {
+        SocketAddr::V4(_) => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)),
+    }
+    .ok()?;
+    probe.connect(to).ok()?;
+    let mtu = match to {
+        SocketAddr::V4(_) => rustix::net::sockopt::ip_mtu(&probe),
+        SocketAddr::V6(_) => rustix::net::sockopt::ipv6_mtu(&probe),
+    }
+    .ok()?;
+    // The headers a v4-mapped peer's datagrams really leave with, not the ones
+    // the family of the socket they were handed to would suggest.
+    let headers = match to.ip() {
+        IpAddr::V4(_) => V4_HEADERS,
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => V4_HEADERS,
+        IpAddr::V6(_) => V6_HEADERS,
+    };
+    usize::try_from(mtu).ok()?.checked_sub(headers)
+}
+
+/// The loss-driven search is the only route here: `IP_DONTFRAG` refuses an
+/// oversize datagram without naming a width, and no route MTU can be read back.
+#[cfg(not(target_os = "linux"))]
+fn narrowed(_: &Mutex<Endpoint>, _: SocketAddr, _: Instant) {}
+
+/// When the tick thread must next be awake. Every path that creates a sooner
+/// deadline calls [`Clock::advance`] rather than waiting for the tick to land:
+/// an acknowledgement owed in 25 ms and held for the tick's quarter second runs
+/// the far side's probe timer out and counts this client silent.
+#[derive(Default)]
+struct Clock {
+    next: Mutex<Option<Instant>>,
+    wake: Condvar,
+}
+
+impl Clock {
+    /// Forget whatever the last pass named, so a deadline already past cannot
+    /// carry into the next sleep. Called before the deadline is recomputed, and
+    /// only by the thread that sleeps: everything after it is an `advance`.
+    fn rearm(&self) {
+        *self.next.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Sleep until `deadline`, or until something names an earlier one.
+    ///
+    /// Merged rather than assigned: the sleeper computes its deadline with the
+    /// endpoint lock released, and an [`advance`](Self::advance) landing in that
+    /// window would otherwise be overwritten by the deadline it raced — which is
+    /// exactly the 25 ms acknowledgement this clock exists to deliver.
+    fn sleep_until(&self, deadline: Instant) {
+        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
+        *next = Some(next.map_or(deadline, |named| named.min(deadline)));
+        loop {
+            let Some(target) = *next else { return };
+            let Some(left) = target.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            let (guard, _) = self
+                .wake
+                .wait_timeout(next, left)
+                .unwrap_or_else(PoisonError::into_inner);
+            next = guard;
+        }
+    }
+
+    /// Bring the next wake forward, if `deadline` is sooner than it.
+    fn advance(&self, deadline: Instant) {
+        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
+        if next.is_none_or(|target| deadline < target) {
+            *next = Some(deadline);
+            self.wake.notify_one();
+        }
+    }
 }
 
 impl DatagramLink {
@@ -125,7 +285,7 @@ impl DatagramLink {
         // rest of the session. It also filters out the daemon's replies, which
         // come from whichever of its host's addresses the route picks.
         widen_receive_buffer(&socket);
-        let fragmentation = refuse_fragmentation(&socket, local);
+        let fragmentation = refuse_fragmentation(&socket);
         let endpoint = Endpoint::connect(
             ConnectionId::from_bytes(offer.cid),
             RootSecret::new(offer.secret),
@@ -143,34 +303,39 @@ impl DatagramLink {
     /// change. `ssh` is still there and needs no thread of its own.
     pub(crate) fn split(self, timeout: Deadline) -> Option<(DatagramSink, DatagramReader)> {
         let Self { socket, shared } = self;
+        let clock = Arc::new(Clock::default());
         // Weak on purpose: the tick stops when both halves are gone, with no
         // flag to set.
         let ticking_socket = Arc::downgrade(&socket);
         let ticking_shared = Arc::downgrade(&shared);
+        let ticking_clock = Arc::clone(&clock);
         thread::Builder::new()
             .name("brd-dgram".into())
             .spawn(staked(Stake::Session, move || {
                 let mut sealed = Vec::with_capacity(BASE_DATAGRAM);
                 loop {
-                    let sleep = {
+                    let deadline = {
                         let (Some(socket), Some(shared)) =
                             (ticking_socket.upgrade(), ticking_shared.upgrade())
                         else {
                             return;
                         };
+                        // Before anything can name a new one, and after the last
+                        // sleep consumed the old one.
+                        ticking_clock.rearm();
                         transmit(&socket, &shared, &mut sealed);
-                        let deadline = shared
+                        let owed = shared
                             .lock()
                             .ok()
                             .and_then(|endpoint| endpoint.poll_deadline());
                         // Both halves are dropped before the sleep, or this
                         // thread keeps the socket open past the session.
-                        deadline.map_or(TRANSMIT_TICK, |at| {
-                            at.saturating_duration_since(Instant::now())
-                                .clamp(TICK_FLOOR, TRANSMIT_TICK)
+                        let now = Instant::now();
+                        owed.map_or(now + TRANSMIT_TICK, |at| {
+                            at.clamp(now + TICK_FLOOR, now + TRANSMIT_TICK)
                         })
                     };
-                    thread::sleep(sleep);
+                    ticking_clock.sleep_until(deadline);
                 }
             }))
             .ok()?;
@@ -178,11 +343,13 @@ impl DatagramLink {
             DatagramSink {
                 socket: Arc::clone(&socket),
                 shared: Arc::clone(&shared),
+                clock: Arc::clone(&clock),
                 outbound: Mutex::default(),
             },
             DatagramReader {
                 socket,
                 shared,
+                clock,
                 timeout,
                 armed: None,
                 datagram: vec![0; MAX_DATAGRAM],
@@ -219,7 +386,15 @@ fn transmit(socket: &UdpSocket, shared: &Mutex<Endpoint>, sealed: &mut Vec<u8>) 
         let Some(datagram) = sealed.get(..len) else {
             return;
         };
-        let _ = socket.send_to(datagram, to);
+        // A probe the kernel refused is otherwise indistinguishable from one
+        // the wire lost, and reading it as loss costs the search a candidate
+        // chance and the minute before that width is offered again.
+        if let Err(error) = socket.send_to(datagram, to)
+            && len > BASE_DATAGRAM
+            && path_refused(&error)
+        {
+            narrowed(shared, to, now);
+        }
     }
 }
 
@@ -252,6 +427,9 @@ pub(crate) struct DatagramSink {
     /// both. What is split is the *work* — the compressor runs before this is
     /// taken and the socket is written after, leaving one AEAD seal inside.
     shared: Arc<Mutex<Endpoint>>,
+    /// Shared with the tick thread: a datagram this half sends may leave an
+    /// acknowledgement or a loss timer owed sooner than the tick would look.
+    clock: Arc<Clock>,
     outbound: Mutex<Outbound>,
 }
 
@@ -272,20 +450,31 @@ impl DatagramSink {
                 return Sealed::Failed;
             };
             sealed.clear();
-            match endpoint.send(packed, now, sealed) {
+            let to = match endpoint.send(packed, now, sealed) {
                 Ok(to) => to,
                 Err(SendError::Blocked) => {
                     return Sealed::Blocked(endpoint.ready(now, packed.len()));
                 }
                 // A frame too large to seal is one this client sized wrong.
                 Err(_) => return Sealed::Failed,
+            };
+            if let Some(at) = endpoint.poll_deadline() {
+                self.clock.advance(at);
             }
+            to
         };
         match self.socket.send_to(sealed, to) {
             Ok(_) => Sealed::Sent,
             // Sealed and spent, and the loss detector reports it: a path that
             // narrowed is the MTU search's business, not a reason to leave.
-            Err(error) if path_refused(&error) => Sealed::Sent,
+            // The kernel already knows the width, so it is asked rather than
+            // rediscovered three losses and two spaced probes later.
+            Err(error) if path_refused(&error) => {
+                if sealed.len() > BASE_DATAGRAM {
+                    narrowed(&self.shared, to, now);
+                }
+                Sealed::Sent
+            }
             Err(_) => Sealed::Failed,
         }
     }
@@ -327,6 +516,9 @@ impl FrameSink for DatagramSink {
 pub(crate) struct DatagramReader {
     socket: Arc<UdpSocket>,
     shared: Arc<Mutex<Endpoint>>,
+    /// Shared with the tick thread: the acknowledgement an arriving datagram
+    /// leaves owed is due in milliseconds, not at the tick's own ceiling.
+    clock: Arc<Clock>,
     timeout: Deadline,
     /// Re-arming is a `setsockopt` and the deadline shrinks a few microseconds
     /// per pass, so arming per datagram would double this path's syscall count
@@ -354,11 +546,24 @@ impl DatagramReader {
     /// `park` runs immediately before this call sleeps and at no other time: a
     /// readable socket is not a frame, since acks, challenges, keep-alives and
     /// forgeries are all consumed here and read past.
-    pub(crate) fn read_frame_into(
-        &mut self,
-        payload: &mut Vec<u8>,
+    pub(crate) fn read_frame<'a>(
+        &'a mut self,
+        scratch: &'a mut Vec<u8>,
         park: &mut dyn FnMut(),
-    ) -> Result<(), DecodeError> {
+    ) -> Result<&'a [u8], DecodeError> {
+        let frame = self.next_frame(park)?;
+        // The bound is what the body may *inflate* to, and this path's own
+        // budget bounds it: `MAX_FRAME` is the stream path's, a hundred
+        // times wider than any datagram carries.
+        unpack(&self.datagram[frame], MAX_PAYLOAD, scratch)
+    }
+
+    /// Where in `self.datagram` the next frame landed.
+    ///
+    /// Split from [`read_frame`](Self::read_frame) because a borrow of
+    /// `self.datagram` cannot be returned out of a loop that also takes `self`
+    /// mutably to read the next datagram into it.
+    fn next_frame(&mut self, park: &mut dyn FnMut()) -> Result<Range<usize>, DecodeError> {
         let deadline = Instant::now() + self.timeout.get();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -370,7 +575,17 @@ impl DatagramReader {
             };
             let now = Instant::now();
             let opened = match self.shared.lock() {
-                Ok(mut endpoint) => endpoint.recv(from, now, &mut self.datagram[..len]),
+                Ok(mut endpoint) => {
+                    let opened = endpoint.recv(from, now, &mut self.datagram[..len]);
+                    // The acknowledgement this datagram owes is due inside the
+                    // far side's probe timer, which a quarter-second tick would
+                    // run out: it counts the packet abandoned, this side
+                    // silent, and two of those collapse its window.
+                    if let Some(at) = endpoint.poll_deadline() {
+                        self.clock.advance(at);
+                    }
+                    opened
+                }
                 Err(_) => return Err(DecodeError::Io(io::Error::other("datagram lock poisoned"))),
             };
             let frame = match opened {
@@ -389,11 +604,8 @@ impl DatagramReader {
             // An ack sent here rather than on the tick is what the server's
             // window reopens on and what its round-trip estimate measures.
             transmit(&self.socket, &self.shared, &mut self.sealed);
-            // The bound is what the body may *inflate* to, and this path's own
-            // budget bounds it: `MAX_FRAME` is the stream path's, a hundred
-            // times wider than any datagram carries.
             if let Some(frame) = frame {
-                return unpack(&self.datagram[frame], MAX_PAYLOAD, payload);
+                return Ok(frame);
             }
         }
     }
@@ -603,6 +815,97 @@ mod tests {
         );
     }
 
+    /// The same fact on Darwin, where neither setting nor reading the option
+    /// has a safe binding: a `setsockopt` that returned `Ok` is not the option
+    /// being in force, and without it every session stays at the floor.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    #[allow(unsafe_code, reason = "IP_DONTFRAG has no safe binding to read back")]
+    fn a_link_socket_refuses_to_fragment() {
+        use std::os::fd::AsRawFd;
+
+        /// The option `libc` does not declare, as `refuse_fragmentation` has it.
+        const IPV6_DONTFRAG: libc::c_int = 62;
+
+        let mut loopback = [0; 16];
+        loopback[15] = 1;
+        let v4 = DatagramLink::open(&mapped(4000)).expect("a v4 link");
+        let v6 = DatagramLink::open(&offer(loopback, 4000)).expect("a v6 link");
+        for (link, level, option) in [
+            (&v4, libc::IPPROTO_IP, libc::IP_DONTFRAG),
+            (&v6, libc::IPPROTO_IPV6, IPV6_DONTFRAG),
+        ] {
+            let mut on: libc::c_int = 0;
+            // What the option is, and what the call writes the length back to.
+            let mut len: libc::socklen_t = 4;
+            // SAFETY: the link owns the descriptor for the whole call, and
+            // `on` and `len` are live and correctly typed for this option.
+            let read = unsafe {
+                libc::getsockopt(
+                    link.socket.as_raw_fd(),
+                    level,
+                    option,
+                    std::ptr::from_mut(&mut on).cast(),
+                    std::ptr::from_mut(&mut len),
+                )
+            };
+            assert_eq!(read, 0, "the option does not read back");
+            assert_ne!(on, 0, "the kernel would still fragment this link's probes");
+        }
+    }
+
+    /// The deadline that matters appears *after* the sleep was computed: a lone
+    /// server frame owes an acknowledgement in 25 ms, and held for the tick's
+    /// quarter second the far side runs the packet to its probe timeout, counts
+    /// this client silent, and collapses its window on the second one.
+    #[test]
+    fn a_deadline_named_after_the_sleep_began_still_wakes_the_tick() {
+        let clock = Arc::new(Clock::default());
+        let ticking = Arc::clone(&clock);
+        let started = Instant::now();
+        let tick = thread::spawn(move || ticking.sleep_until(Instant::now() + TRANSMIT_TICK * 20));
+        // The sleep has to be under way, or this names a deadline before it.
+        thread::sleep(Duration::from_millis(20));
+        clock.advance(Instant::now() + Duration::from_millis(5));
+        tick.join().expect("the tick thread wakes");
+        assert!(
+            started.elapsed() < TRANSMIT_TICK,
+            "the tick slept out a deadline something had brought forward"
+        );
+    }
+
+    /// The other half of the same race, and the harder one: the sleeper computes
+    /// its deadline with the endpoint lock released, so an acknowledgement owed
+    /// in that window is named before the sleep begins and would be lost to a
+    /// clock that assigned over it rather than taking the sooner of the two.
+    #[test]
+    fn a_deadline_named_before_the_sleep_began_still_shortens_it() {
+        let clock = Clock::default();
+        clock.rearm();
+        clock.advance(Instant::now() + Duration::from_millis(5));
+        let started = Instant::now();
+        clock.sleep_until(Instant::now() + TRANSMIT_TICK * 20);
+        assert!(
+            started.elapsed() < TRANSMIT_TICK,
+            "the sleep overwrote a deadline that landed while it was being computed"
+        );
+    }
+
+    /// And the deadline a pass has already slept out must not shorten the next
+    /// one, or the tick spins.
+    #[test]
+    fn rearming_forgets_a_deadline_the_last_pass_consumed() {
+        let clock = Clock::default();
+        clock.advance(Instant::now());
+        clock.rearm();
+        let started = Instant::now();
+        clock.sleep_until(Instant::now() + Duration::from_millis(30));
+        assert!(
+            started.elapsed() >= Duration::from_millis(25),
+            "a spent deadline carried into the next sleep"
+        );
+    }
+
     /// `EMSGSIZE` is the ordinary outcome of a path that narrowed. Provoked
     /// with a datagram past the UDP maximum, which every kernel refuses.
     #[test]
@@ -695,12 +998,12 @@ mod tests {
                 .split(Deadline::new(Duration::from_secs(5)))
                 .expect("the tick thread starts");
             assert!(sink.send(message.encode(Version::LOCAL).expect("the message encodes")));
-            let mut payload = Vec::new();
-            reader
-                .read_frame_into(&mut payload, &mut || {})
+            let mut scratch = Vec::new();
+            let answer = reader
+                .read_frame(&mut scratch, &mut || {})
                 .expect("the answer comes back");
             assert_eq!(
-                ClientMessage::decode(&payload, Version::LOCAL).expect("the answer decodes"),
+                ClientMessage::decode(answer, Version::LOCAL).expect("the answer decodes"),
                 message
             );
             echoed.join().expect("the daemon half finishes");
@@ -733,7 +1036,7 @@ mod tests {
         let mut parks = 0;
         let mut payload = Vec::new();
         reader
-            .read_frame_into(&mut payload, &mut || parks += 1)
+            .read_frame(&mut payload, &mut || parks += 1)
             .expect("the answer comes back");
         assert_eq!(parks, 0, "a datagram already queued was parked for");
 
@@ -744,7 +1047,7 @@ mod tests {
             ..reader
         };
         let waited = reader
-            .read_frame_into(&mut payload, &mut || parks += 1)
+            .read_frame(&mut payload, &mut || parks += 1)
             .expect_err("nothing else is coming");
         assert!(waited.is_transport_loss(), "silence is a transport loss");
         assert!(parks > 0, "a read that slept never said it was about to");
@@ -821,11 +1124,14 @@ mod tests {
     /// `unpack` is the whole check and must refuse rather than index-panic.
     #[test]
     fn a_datagram_body_that_is_not_a_frame_is_refused() {
-        let mut payload = Vec::new();
-        assert!(unpack(&[], MAX_PAYLOAD, &mut payload).is_err());
-        assert!(unpack(&[0xEE, 1, 2], MAX_PAYLOAD, &mut payload).is_err());
-        assert!(unpack(&[0, 1, 2], MAX_PAYLOAD, &mut payload).is_ok());
-        assert_eq!(payload, vec![1, 2]);
+        let mut scratch = Vec::new();
+        assert!(unpack(&[], MAX_PAYLOAD, &mut scratch).is_err());
+        assert!(unpack(&[0xEE, 1, 2], MAX_PAYLOAD, &mut scratch).is_err());
+        // Stored, so the answer is the datagram's own bytes and the scratch is untouched.
+        assert_eq!(
+            unpack(&[0, 1, 2], MAX_PAYLOAD, &mut scratch).expect("a stored body"),
+            &[1, 2]
+        );
     }
 
     /// The ceiling this path reads against is its own: `MAX_FRAME` would be a
@@ -893,13 +1199,20 @@ mod tests {
 
         let mut payload = Vec::new();
         let refused = reader
-            .read_frame_into(&mut payload, &mut || {})
+            .read_frame(&mut payload, &mut || {})
             .expect_err("a body no datagram could have carried was admitted");
         assert!(
             !refused.is_transport_loss(),
             "the answer never arrived, so nothing was proved: {refused:?}"
         );
-        assert!(payload.is_empty(), "the bomb was inflated anyway");
+        // The length, not the capacity: `room_for` never offers the decompressor
+        // more than the ceiling, and what a `Vec` rounds its allocation up to is
+        // the allocator's business.
+        assert!(
+            payload.len() <= MAX_PAYLOAD,
+            "the bomb was inflated anyway: {} bytes against a {MAX_PAYLOAD}-byte ceiling",
+            payload.len()
+        );
         answered.join().expect("the daemon half finishes");
     }
 }

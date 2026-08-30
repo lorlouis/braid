@@ -17,11 +17,14 @@ pub use screen::{
     StyleAttrs, StyleColor, StyleRun, UnderlineStyle,
 };
 
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 
 /// The oldest frame layout this build decodes. Appending a field or a message raises
 /// [`PROTOCOL_VERSION`] and leaves this alone; raising *this* is a flag day.
-pub const MIN_PROTOCOL_VERSION: u16 = 14;
+///
+/// 16 is such a day: a row's style runs carry their byte extent in two octets rather
+/// than four, which no 15 decoder can read and no 15 encoder can write.
+pub const MIN_PROTOCOL_VERSION: u16 = 16;
 
 /// The dialect `brd ls`, `brd kill` and `brd grep` are spoken in, on a connection that
 /// never handshook. **It never moves.**
@@ -116,19 +119,17 @@ impl Version {
     pub const fn get(self) -> u16 {
         self.0
     }
-
-    /// Whether a peer at this version understands [`ServerMessage::OutputSkipped`].
-    ///
-    /// A *message*, unlike a field, carries no version gate in the codec — an unknown
-    /// tag is a hard [`DecodeError::BadTag`], not a skip — so the sender is the only
-    /// thing that can keep one away from a peer too old to read it.
-    pub const fn carries_output_skipped(self) -> bool {
-        self.0 >= OUTPUT_SKIPPED_VERSION
-    }
 }
 
 /// The version [`ServerMessage::OutputSkipped`] was appended in.
+///
+/// A *message*, unlike a field, carries no version gate in the codec — an unknown tag is
+/// a hard [`DecodeError::BadTag`], not a skip — so a peer below this must never be sent
+/// one. The floor sits above it, so the assertion beneath is the whole gate: lowering the
+/// floor under a message's own version is a compile error rather than a client hanging up
+/// on a tag it cannot read.
 const OUTPUT_SKIPPED_VERSION: u16 = 15;
+const _: () = assert!(MIN_PROTOCOL_VERSION >= OUTPUT_SKIPPED_VERSION);
 
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -256,6 +257,12 @@ impl SackRuns {
 
     pub fn new(runs: Vec<SackRun>) -> Option<Self> {
         (runs.len() <= MAX_ACK_RUNS).then_some(Self(runs))
+    }
+
+    /// Refill from a retained buffer: the forward receiver rebuilds this per
+    /// acknowledgement, which is once per arrival including a duplicate.
+    pub fn from_slice(runs: &[SackRun]) -> Option<Self> {
+        (runs.len() <= MAX_ACK_RUNS).then(|| Self(runs.to_vec()))
     }
 
     #[must_use]
@@ -1230,6 +1237,37 @@ pub fn encode_screen_parts<'a, I>(
 where
     I: Iterator<Item = RowUpdate<'a>> + Clone,
 {
+    let mut parts = Vec::new();
+    encode_screen_parts_into(
+        header,
+        base,
+        scroll,
+        rows,
+        budget,
+        &mut parts,
+        &mut Vec::new(),
+    )?;
+    Ok(parts)
+}
+
+/// The same, drawing each piece's buffer from `spare` and leaving the pieces in `parts`.
+///
+/// A screen is cut once per repaint at up to the repaint rate, and the server recycles
+/// retired pieces into `spare`: returning owned buffers instead would make every raw
+/// piece a fresh allocation the pool could never serve.
+pub fn encode_screen_parts_into<'a, I>(
+    header: &ScreenHeader,
+    base: Option<ScreenVersion>,
+    scroll: Option<ScrollBand>,
+    rows: I,
+    budget: usize,
+    parts: &mut Vec<Vec<u8>>,
+    spare: &mut Vec<Vec<u8>>,
+) -> Result<(), EncodeError>
+where
+    I: Iterator<Item = RowUpdate<'a>> + Clone,
+{
+    parts.clear();
     if let Some(band) = scroll
         && !band.is_applicable(header.size.rows)
     {
@@ -1244,7 +1282,8 @@ where
     // not fit the `Head` simply starts the next piece.
     let chunk_budget = budget - TAIL_FIXED - PART_ROW_HEAD;
     // Chunks per piece and its size, decided before a byte is written: a `Head` carries the total.
-    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    // Sized for the screens this actually cuts, so a ten-piece screen reallocs none.
+    let mut cuts: Vec<(usize, usize)> = Vec::with_capacity(8);
     let mut used = head_fixed;
     let mut count = 0_usize;
     for entry in spans(rows.clone(), chunk_budget) {
@@ -1271,9 +1310,10 @@ where
     }
 
     let mut cut = spans(rows, chunk_budget);
-    let mut parts = Vec::with_capacity(cuts.len());
+    parts.reserve(cuts.len());
     for (index, (count, size)) in (0..pieces).zip(cuts) {
-        let mut out = open_frame(size - LENGTH_PREFIX);
+        let mut out = spare.pop().unwrap_or_default();
+        open_frame_into(&mut out, size - LENGTH_PREFIX);
         out.push(ServerTag::Screen as u8 + SERVER_TAG_BASE);
         if index == 0 {
             out.push(0);
@@ -1289,9 +1329,10 @@ where
             put_u16(&mut out, index);
         }
         encode_part_rows(&mut out, count, cut.by_ref().take(count))?;
-        parts.push(finish(out)?);
+        seal_frame(&mut out)?;
+        parts.push(out);
     }
-    Ok(parts)
+    Ok(())
 }
 
 /// Every row update as the spans a piece can carry, in row order. Borrowed throughout, so
@@ -1581,15 +1622,16 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Start a frame with room for the length its contents will need; the prefix is written
-/// last, by [`finish`], so nothing copies the payload.
-fn open_frame(capacity: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(capacity + LENGTH_PREFIX);
+/// Start a frame in a buffer the caller keeps, with room for the length its contents
+/// will need; the prefix is written last, by [`seal_frame`], so nothing copies the
+/// payload. Caller-owned throughout, so a pooled screen piece pays no allocation.
+fn open_frame_into(out: &mut Vec<u8>, capacity: usize) {
+    out.clear();
+    out.reserve(capacity + LENGTH_PREFIX);
     out.extend_from_slice(&[0; LENGTH_PREFIX]);
-    out
 }
 
-/// Write a frame's length over the prefix [`open_frame`] reserved.
+/// Write a frame's length over the prefix [`open_frame_into`] reserved.
 ///
 /// Public because the datagram cut frames its own pieces: the length prefix
 /// comes off the wire there and goes back on around the packed body, and a
@@ -1602,11 +1644,6 @@ pub fn seal_frame(frame: &mut [u8]) -> Result<(), EncodeError> {
     }
     frame[..LENGTH_PREFIX].copy_from_slice(&length.to_be_bytes());
     Ok(())
-}
-
-fn finish(mut frame: Vec<u8>) -> Result<Vec<u8>, EncodeError> {
-    seal_frame(&mut frame)?;
-    Ok(frame)
 }
 
 /// A `TERM` reaches a child process's environment, so it is admitted as a terminfo name and nothing else.
@@ -2240,7 +2277,9 @@ ref_field! {
         if count > MAX_ACK_RUNS {
             return Err(DecodeError::InvalidField);
         }
-        let mut runs = Vec::with_capacity(count);
+        // Clamped by what is actually left as well as by the constant, which is the
+        // shape every other count-led reservation in this file already has.
+        let mut runs = Vec::with_capacity(count.min(c.remaining() / 8));
         for _ in 0..count {
             // A zero gap puts a run against the cumulative offset — the receiver both has and has
             // not those bytes — and a zero length is a run that names nothing.
@@ -2301,9 +2340,7 @@ macro_rules! borrowed_encoder {
             out: &mut Vec<u8>,
             $( $field: <$codec as Field>::Ref<'_>, )*
         ) -> Result<(), EncodeError> {
-            out.clear();
-            out.reserve(LENGTH_PREFIX + 1 $( + <$codec as Field>::hint($field) )*);
-            out.extend_from_slice(&[0; LENGTH_PREFIX]);
+            open_frame_into(out, 1 $( + <$codec as Field>::hint($field) )*);
             out.push($tags::$variant as u8 + $base);
             $( <$codec as Field>::put(out, $field)?; )*
             seal_frame(out)
@@ -2351,15 +2388,22 @@ macro_rules! messages {
                 }
             }
 
-            pub fn encode(&self, spoken: Version) -> Result<Vec<u8>, EncodeError> {
-                let mut out = open_frame(self.hint());
+            /// Into a caller-owned buffer, so a control frame on the keystroke path
+            /// draws from the same spare pool the output path already recycles
+            /// through rather than allocating one per `CommandAck` and per `Ping`.
+            pub fn encode_into(
+                &self,
+                spoken: Version,
+                out: &mut Vec<u8>,
+            ) -> Result<(), EncodeError> {
+                open_frame_into(out, self.hint());
                 match self {
                     $(
                         Self::$variant { $( $field, )* } => {
                             out.push($tags::$variant as u8 + $base);
                             $(
                                 put_field!(
-                                    spoken, &mut out, $codec,
+                                    spoken, &mut *out, $codec,
                                     <$codec as Field>::borrow($field)
                                     $(, since $since, default $default)?
                                 )?;
@@ -2367,7 +2411,13 @@ macro_rules! messages {
                         }
                     )*
                 }
-                finish(out)
+                seal_frame(out)
+            }
+
+            pub fn encode(&self, spoken: Version) -> Result<Vec<u8>, EncodeError> {
+                let mut out = Vec::new();
+                self.encode_into(spoken, &mut out)?;
+                Ok(out)
             }
 
             pub fn decode(payload: &[u8], spoken: Version) -> Result<Self, DecodeError> {
@@ -2388,6 +2438,51 @@ macro_rules! messages {
             }
         }
     };
+}
+
+/// One `Output` message with its payload still inside the frame it arrived in.
+///
+/// The owning [`ServerMessage::decode`] copies that payload out with `to_vec`, and the
+/// client's reader then uses it by reference and drops it one statement later — a
+/// `MAX_OUTPUT_CHUNK` allocation and memcpy per frame, out of a buffer the reader
+/// already reuses precisely so it would not allocate.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputRef<'a> {
+    pub off: ByteOff,
+    pub cue: InputCue,
+    pub echo_ack: Option<CmdSeq>,
+    pub bytes: &'a [u8],
+}
+
+/// `None` when this is not an `Output`, so a caller falls through to the owning
+/// [`ServerMessage::decode`] for every other message rather than duplicating it.
+///
+/// Checked against the generated decoder by `a_peeked_output_matches_the_owning_decode`:
+/// the field order here is `Output`'s and a change to one that misses the other is a
+/// test failure rather than a wire that reads two ways.
+pub fn peek_output(payload: &[u8]) -> Option<Result<OutputRef<'_>, DecodeError>> {
+    let mut c = Cursor::new(payload);
+    if c.u8().ok()? != ServerTag::Output as u8 + SERVER_TAG_BASE {
+        return None;
+    }
+    Some((|| {
+        let off = <Off as Field>::get(&mut c)?;
+        let cue = <Cue as Field>::get(&mut c)?;
+        let echo_ack = <OptSeq as Field>::get(&mut c)?;
+        let len = c.u32()?;
+        let limit = u32::try_from(MAX_OUTPUT_CHUNK).unwrap_or(u32::MAX);
+        if len > limit {
+            return Err(DecodeError::Oversize { actual: len, limit });
+        }
+        let len = usize::try_from(len).map_err(|_| DecodeError::InvalidField)?;
+        let bytes = c.take(len)?;
+        Ok(OutputRef {
+            off,
+            cue,
+            echo_ack,
+            bytes,
+        })
+    })())
 }
 
 /// Encode one output chunk straight from the buffer that holds it, into a caller-owned
@@ -2918,16 +3013,157 @@ mod tests {
             "an input frame was allocated larger than it needed, so the hint is wrong"
         );
 
-        // The third shape is the screen: each piece is written into a buffer the cut sized.
+        // The third shape is the screen: each piece is written into a buffer the cut
+        // sized, so a retired piece handed back through `spare` is written again whole
+        // without the pool's allocation growing under it.
         let header = screen_header(small_grid(), None);
         let rows = [plain("hello")];
-        let pieces = encode_screen_parts(&header, None, None, indexed(&rows), frame_budget())
+        let mut parts = Vec::new();
+        let mut spare = Vec::new();
+        let cut = |parts: &mut Vec<Vec<u8>>, spare: &mut Vec<Vec<u8>>| {
+            encode_screen_parts_into(
+                &header,
+                None,
+                None,
+                indexed(&rows),
+                frame_budget(),
+                parts,
+                spare,
+            )
             .expect("a screen cuts");
-        assert_eq!(pieces.len(), 1);
-        assert!(
-            pieces[0].capacity() >= pieces[0].len(),
-            "a screen piece outgrew the buffer its cut reserved"
+        };
+        cut(&mut parts, &mut spare);
+        assert_eq!(parts.len(), 1);
+        let sized = parts[0].capacity();
+        assert!(sized >= parts[0].len(), "a screen piece outgrew its cut");
+        spare.append(&mut parts);
+        cut(&mut parts, &mut spare);
+        assert_eq!(
+            parts[0].capacity(),
+            sized,
+            "a recycled screen piece reallocated, so the cut's size is not what a piece costs"
         );
+    }
+
+    /// The borrowed peek is a second decoder for one message, so what keeps the wire
+    /// from reading two ways is this: it must agree with the generated one, field for
+    /// field, and answer `None` for everything else.
+    #[test]
+    fn a_peeked_output_matches_the_owning_decode() {
+        for (off, cue, echo_ack, bytes) in [
+            (0_u64, InputCue::Opaque, None, Vec::new()),
+            (9, InputCue::Opaque, Some(CmdSeq::first()), vec![b'x'; 4096]),
+            (
+                u64::from(u32::MAX),
+                InputCue::Echoing { room: 3 },
+                None,
+                b"\x1b[1;32m$ ".to_vec(),
+            ),
+        ] {
+            let mut frame = Vec::new();
+            encode_output_into(&mut frame, ByteOff::from_u64(off), cue, echo_ack, &bytes)
+                .expect("an output encodes");
+            let payload = &frame[LENGTH_PREFIX..];
+            let peeked = peek_output(payload)
+                .expect("an output payload")
+                .expect("it decodes");
+            let ServerMessage::Output {
+                off: owned_off,
+                cue: owned_cue,
+                echo_ack: owned_ack,
+                bytes: owned_bytes,
+            } = ServerMessage::decode(payload, Version::LOCAL).expect("it decodes")
+            else {
+                panic!("the owning decode read a different message");
+            };
+            assert_eq!(
+                (peeked.off, peeked.cue, peeked.echo_ack, peeked.bytes),
+                (owned_off, owned_cue, owned_ack, owned_bytes.as_slice())
+            );
+            // The whole point: the payload is still inside the caller's frame.
+            assert!(
+                peeked.bytes.as_ptr_range().start >= payload.as_ptr_range().start
+                    && peeked.bytes.as_ptr_range().end <= payload.as_ptr_range().end
+            );
+        }
+
+        let other = ServerMessage::CommandAck {
+            highest: Some(CmdSeq::first()),
+        }
+        .encode(Version::LOCAL)
+        .expect("an ack encodes");
+        assert!(peek_output(&other[LENGTH_PREFIX..]).is_none());
+        assert!(peek_output(&[]).is_none());
+    }
+
+    /// A control frame per keystroke is what this exists to stop allocating.
+    #[test]
+    fn encoding_into_a_warm_buffer_matches_encoding_into_a_fresh_one() {
+        let messages = [
+            ServerMessage::CommandAck {
+                highest: Some(CmdSeq::first()),
+            },
+            ServerMessage::Ping {
+                token: 7,
+                echo_ack: None,
+                interval_ms: 250,
+            },
+            ServerMessage::Exit { code: 0 },
+        ];
+        let mut out = Vec::new();
+        for message in &messages {
+            message
+                .encode_into(Version::LOCAL, &mut out)
+                .expect("a control frame encodes");
+            assert_eq!(
+                out,
+                message.encode(Version::LOCAL).expect("the owning encode")
+            );
+        }
+        let warm = out.capacity();
+        for _ in 0..64 {
+            for message in &messages {
+                message
+                    .encode_into(Version::LOCAL, &mut out)
+                    .expect("a control frame encodes");
+            }
+        }
+        assert_eq!(out.capacity(), warm, "the control path kept reallocating");
+    }
+
+    /// The two decoders state `MAX_OUTPUT_CHUNK` in two places, so what keeps them from
+    /// drifting is that they refuse the same frame. The equivalence test above never
+    /// reaches this: every payload it carries is well inside the bound.
+    #[test]
+    fn the_peek_and_the_decoder_refuse_the_same_oversize_chunk() {
+        let bytes = vec![b'x'; 8];
+        let mut frame = Vec::new();
+        encode_output_into(
+            &mut frame,
+            ByteOff::from_u64(9),
+            InputCue::Opaque,
+            Some(CmdSeq::first()),
+            &bytes,
+        )
+        .expect("an output encodes");
+        // The chunk's own length prefix, which is the last field before its bytes.
+        let at = frame.len() - bytes.len() - 4;
+        let limit = u32::try_from(MAX_OUTPUT_CHUNK).expect("a bound that fits");
+        for actual in [limit + 1, u32::MAX] {
+            frame[at..at + 4].copy_from_slice(&actual.to_be_bytes());
+            let payload = &frame[LENGTH_PREFIX..];
+            let peeked = peek_output(payload)
+                .expect("an output payload")
+                .expect_err("a chunk past the bound");
+            let owned =
+                ServerMessage::decode(payload, Version::LOCAL).expect_err("a chunk past the bound");
+            for refusal in [peeked, owned] {
+                assert!(
+                    matches!(refusal, DecodeError::Oversize { actual: a, limit: l } if a == actual && l == limit),
+                    "a chunk of {actual} against a {limit}-byte bound was refused as {refusal:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3026,23 +3262,16 @@ mod tests {
     }
 
     /// A message, unlike a field, has no gate in the codec: an unknown tag is a hard
-    /// error, so a peer that predates one must never be sent it. The gate is the sender's.
+    /// error, so a peer that predates one must never be sent it. The floor is past
+    /// `OutputSkipped`, so the gate is `MIN_PROTOCOL_VERSION >= OUTPUT_SKIPPED_VERSION`
+    /// beside the constant, and this is what says the version it names is the version
+    /// the notice actually decodes at.
     #[test]
-    fn skipped_output_is_refused_to_a_peer_that_predates_it() {
-        assert!(Version::LOCAL.carries_output_skipped());
-        assert!(
-            !Version::MANAGEMENT.carries_output_skipped(),
-            "management is frozen below this message and must never be sent one"
-        );
-        assert!(
-            !Version::FLOOR.carries_output_skipped(),
-            "the oldest peer this build still speaks to cannot decode this tag"
-        );
-
+    fn every_message_this_build_sends_is_one_the_floor_can_decode() {
         let message = ServerMessage::OutputSkipped { bytes: 1 << 20 };
         let frame = message.encode(Version::LOCAL).expect("a notice encodes");
         assert_eq!(
-            ServerMessage::decode(&frame[LENGTH_PREFIX..], Version::LOCAL).expect("a notice"),
+            ServerMessage::decode(&frame[LENGTH_PREFIX..], Version::FLOOR).expect("a notice"),
             message
         );
     }
@@ -3348,7 +3577,8 @@ mod tests {
             bytes: 4,
             style: CellStyle::default(),
         });
-        assert_eq!(one(&rows) - bare, 11);
+        // Two of cells, two of bytes, attrs, underline, and a default colour byte each.
+        assert_eq!(one(&rows) - bare, 9);
     }
 
     /// A row is painted over an erased line, so trailing blanks carrying no style are already
@@ -3392,21 +3622,30 @@ mod tests {
         assert!(named.iter().all(|span| span.frame.cells == size.cols));
 
         // A styled trailing run paints, so `styled_bytes` keeps it and the text travels whole.
+        // Two runs, not one: `MAX_RUN_BYTES` is what makes every row cuttable, so a
+        // full-width run on the widest grid is one the emulator never builds either.
         let mut painted = rows;
-        painted[0].runs.push(StyleRun {
-            cells: size.cols,
-            bytes: u32::from(size.cols),
-            style: CellStyle {
-                bg: StyleColor::Palette(4),
-                ..CellStyle::default()
-            },
-        });
+        let half = size.cols / 2;
+        for _ in 0..2 {
+            painted[0].runs.push(StyleRun {
+                cells: half,
+                bytes: u32::from(half),
+                style: CellStyle {
+                    bg: StyleColor::Palette(4),
+                    ..CellStyle::default()
+                },
+            });
+        }
         assert_eq!(painted[0].painted_bytes(), usize::from(size.cols));
-        // The row's text, plus a run whose palette colour costs a byte more than three defaults.
+        // The row's text, plus two runs whose palette colour costs a byte more than three
+        // defaults.
         let with_tail = encode_screen_parts(&header, None, None, indexed(&painted), frame_budget())
             .expect("a screen carrying a painted row")
             .remove(0);
-        assert_eq!(with_tail.len(), encoded.len() + usize::from(size.cols) + 12);
+        assert_eq!(
+            with_tail.len(),
+            encoded.len() + usize::from(size.cols) + 2 * 10
+        );
         let ServerMessage::Screen {
             part: ScreenPart::Head { rows: named, .. },
         } = ServerMessage::decode(&with_tail[4..], Version::LOCAL).unwrap()

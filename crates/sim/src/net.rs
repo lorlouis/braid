@@ -249,6 +249,9 @@ pub struct Sim<S: Schedule> {
     bottleneck: HashMap<Side, Bottleneck>,
     /// Addresses that are receiving nothing, and until when.
     deaf: HashMap<SocketAddr, Instant>,
+    /// The widest datagram the path itself carries, which a rebind may move:
+    /// [`crate::fault::Narrows`] belongs to the schedule and so cannot.
+    carries: Option<usize>,
 
     client: Endpoint,
     server: Endpoint,
@@ -296,6 +299,7 @@ impl<S: Schedule> Sim<S> {
             order: 0,
             bottleneck: HashMap::new(),
             deaf: HashMap::new(),
+            carries: None,
             // The simulated link has no IP layer to cut a datagram up with.
             client: Endpoint::connect(
                 cid,
@@ -409,6 +413,14 @@ impl<S: Schedule> Sim<S> {
         let mut moved = self.at[&Side::Client];
         moved.set_port(port);
         self.at.insert(Side::Client, moved);
+    }
+
+    /// What the path carries from here on. Paired with [`roam`](Self::roam) or
+    /// [`rebind`](Self::rebind) it is the case a width measured on the old path
+    /// is wrong about: a tether behind a tunnel, reached with a search settled
+    /// at nine kilobytes.
+    pub const fn narrow_to(&mut self, carries: Option<usize>) {
+        self.carries = carries;
     }
 
     /// A laptop lid: every timer comes back overdue at once.
@@ -563,6 +575,11 @@ impl<S: Schedule> Sim<S> {
             }
         }
         self.charge(from, to, bytes.len() as u64);
+        // Charged first: the sender spent it, and a width the path refuses in
+        // silence is precisely what the black-hole rule has to see.
+        if self.carries.is_some_and(|carries| bytes.len() > carries) {
+            return;
+        }
         let source = self.at[&from];
         let fault = self.schedule.next(from, &bytes);
         if fault == Fault::Drop {
@@ -749,11 +766,13 @@ impl<S: Schedule> Sim<S> {
     }
 
     fn hand_up(&mut self, side: Side, body: &[u8], sealed: Option<(Side, Epoch, u64)>) {
-        let mut frame = Vec::new();
-        if unpack(body, MAX_FRAME as usize, &mut frame).is_err() {
+        let mut scratch = Vec::new();
+        let Ok(frame) = unpack(body, MAX_FRAME as usize, &mut scratch) else {
             self.violations.push(Violation::Unpackable { side });
             return;
-        }
+        };
+        // Owned from here: the violations and the delivered log both outlive the scratch.
+        let frame = frame.to_vec();
         let Some(id) = sealed.and_then(|key| self.carrying.get(&key).copied()) else {
             self.violations.push(Violation::Fabricated { side, frame });
             return;

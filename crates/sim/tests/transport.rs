@@ -3,12 +3,25 @@
 
 use braid_sim::fault::{Fault, GilbertElliott, Perfect, Schedule, Script};
 use braid_sim::net::{Side, Sim};
+use braid_sim::rng::Rng;
 use std::time::Duration;
 
 /// Frames with a body, so a run carries something the link has to serialise.
 fn frame(n: u32) -> Vec<u8> {
     let mut bytes = n.to_be_bytes().to_vec();
     bytes.extend_from_slice(b" the quick brown fox jumps over the lazy dog");
+    bytes
+}
+
+/// Incompressible: the harness packs what it sends, so a screen of one repeated
+/// byte leaves as thirty on the wire and crosses a path that carries none.
+fn screen(n: u32, size: usize) -> Vec<u8> {
+    let mut bytes = n.to_be_bytes().to_vec();
+    let mut rng = Rng::seeded(u64::from(n));
+    while bytes.len() < size.max(4) {
+        bytes.extend_from_slice(&rng.next_u64().to_be_bytes());
+    }
+    bytes.truncate(size.max(4));
     bytes
 }
 
@@ -305,4 +318,56 @@ fn a_hostile_link_still_carries_a_session() {
     sim.assert_sound();
     let delivered = sim.delivered(Side::Server).len();
     assert!(delivered > 200, "only {delivered} of 1000 arrived");
+}
+
+/// A width is a measurement of the path it was taken on. Carried across a move
+/// onto a narrower one, every screen the session cuts to it disappears while the
+/// keystrokes keep crossing, so the connection is alive by every measure the
+/// black-hole rule then needs seconds and two probes to disbelieve — and the
+/// screens already cut to the stale budget are gone whichever way it ends.
+#[test]
+fn a_move_onto_a_narrower_path_starts_the_search_again_instead_of_black_holing() {
+    let mut sim = Sim::new(Perfect);
+    let base = sim.payload_limit(Side::Server);
+    for n in 0..60u32 {
+        assert!(sim.send(Side::Server, &screen(n, 400)).is_some());
+    }
+    sim.settle();
+    assert!(
+        sim.payload_limit(Side::Server) > base,
+        "the search never found the wide path: {:?}",
+        sim.stats(Side::Server)
+    );
+
+    // A tether behind a tunnel: the same session, over a path that carries a
+    // seventh of what the one it left did. Below the smallest candidate, so the
+    // search that starts again finds nothing above the floor either.
+    let home = sim.address(Side::Client);
+    sim.narrow_to(Some(1_300));
+    sim.rebind(home.port() + 9);
+    assert!(sim.send(Side::Client, &screen(60, 8)).is_some());
+    sim.settle();
+    assert_eq!(sim.peer_of(Side::Server), sim.address(Side::Client));
+    assert_eq!(
+        sim.payload_limit(Side::Server),
+        base,
+        "the server is still cutting screens for the path it left"
+    );
+
+    let before = sim.delivered(Side::Client).len();
+    for n in 100..140u32 {
+        let size = sim.payload_limit(Side::Server);
+        assert!(sim.send(Side::Server, &screen(n, size)).is_some());
+    }
+    sim.settle();
+    sim.assert_sound();
+    assert_eq!(
+        sim.delivered(Side::Client).len(),
+        before + 40,
+        "the session went dark on a path that carries every one of them"
+    );
+    assert_eq!(
+        sim.unsendable, 0,
+        "and none was cut for a width it never had"
+    );
 }

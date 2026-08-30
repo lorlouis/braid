@@ -5,7 +5,9 @@
 //! The base is the *confirmed* screen, not the previous frame: paced at SRTT/2
 //! with one screen outstanding, a client may have answered none of the last ten.
 
-use braid_proto::{Generation, RowFrame, RowUpdate, ScreenHeader, ScreenVersion, ScrollBand};
+use braid_proto::{
+    CellStyle, Generation, RowFrame, RowUpdate, ScreenHeader, ScreenVersion, ScrollBand, StyleColor,
+};
 use braid_vt::{RepaintFrame, RowMask};
 
 /// `rows` is reused across calls, so a 30 Hz sync burst allocates nothing once
@@ -94,6 +96,13 @@ pub struct ScreenLedger {
     /// The row list a band rebuilds into, held rather than reallocated on a
     /// path that runs thirty times a second.
     named: Vec<PlannedRow>,
+    /// A hash of every row of the two screens above, filled only where a band
+    /// search is in play: the guard on that search skips one that cannot pay,
+    /// and the hashing it would need with it. `confirmed_hashes` is a cache of
+    /// `confirmed_rows`, emptied wherever those rows are replaced;
+    /// `frame_hashes` belongs to one frame and is rebuilt for each.
+    confirmed_hashes: Vec<u64>,
+    frame_hashes: Vec<u64>,
     plan: Plan,
 }
 
@@ -115,6 +124,8 @@ impl ScreenLedger {
             in_flight_damage: RowMask::default(),
             sent_unconfirmed: RowMask::default(),
             named: Vec::new(),
+            confirmed_hashes: Vec::new(),
+            frame_hashes: Vec::new(),
             plan: Plan::default(),
         }
     }
@@ -130,6 +141,7 @@ impl ScreenLedger {
     pub fn invalidate(&mut self, rows: u16) {
         self.confirmed = None;
         self.confirmed_rows.clear();
+        self.confirmed_hashes.clear();
         self.pending = None;
         self.damage = RowMask::filled(rows);
         self.in_flight_damage.reset(rows);
@@ -218,16 +230,26 @@ impl ScreenLedger {
         }
         // A band carries its own row list, so it can only pay against a
         // difference of at least two rows.
-        if self.plan.rows.len() > 1
-            && let Some(found) = band(
-                &self.confirmed_rows,
-                &frame.rows,
+        if self.plan.rows.len() > 1 {
+            if self.confirmed_hashes.is_empty() {
+                hash_rows(&mut self.confirmed_hashes, &self.confirmed_rows);
+            }
+            hash_rows(&mut self.frame_hashes, &frame.rows);
+            if let Some(found) = band(
+                Hashed {
+                    rows: &self.confirmed_rows,
+                    hashes: &self.confirmed_hashes,
+                },
+                Hashed {
+                    rows: &frame.rows,
+                    hashes: &self.frame_hashes,
+                },
                 count,
                 &self.plan.rows,
                 &self.sent_unconfirmed,
-            )
-        {
-            self.scroll_to(found);
+            ) {
+                self.scroll_to(found);
+            }
         }
         // A delta naming every row costs a row index more than the screen it
         // replaces.
@@ -296,6 +318,7 @@ impl ScreenLedger {
         // The buffer the confirmed rows vacate becomes the next snapshot's,
         // which is what keeps a sync burst allocation-free.
         std::mem::swap(&mut self.confirmed_rows, &mut self.pending_rows);
+        self.confirmed_hashes.clear();
         self.confirmed = Some((generation, version));
         true
     }
@@ -335,6 +358,13 @@ fn partial(frame: &RowFrame, runs: (usize, usize)) -> RowPlan {
     }
 }
 
+/// One screen as the band search reads it.
+#[derive(Clone, Copy)]
+struct Hashed<'a> {
+    rows: &'a [RowFrame],
+    hashes: &'a [u64],
+}
+
 /// The band of rows that moved, when moving it costs less than naming those
 /// rows outright.
 ///
@@ -344,9 +374,17 @@ fn partial(frame: &RowFrame, runs: (usize, usize)) -> RowPlan {
 /// it; a shift of `lines` always costs at least `lines`, so the search walks
 /// shifts upwards and stops once the best band it holds is no dearer than the
 /// shift it is about to try.
+///
+/// The scan itself is over the per-row hashes, not the rows. The grid is
+/// client-chosen up to 512 by 1024 and libghostty pads every row to the full
+/// width, so a `RowFrame` comparison never short-circuits on length and is a
+/// real kilobyte `memcmp`; at `damaged x rows` of them, an htop repaint that
+/// scrolled nothing ran the whole search to return `None`. A candidate is
+/// confirmed against the rows themselves before it is kept, so a collision is
+/// one wasted confirmation rather than a band the client cannot apply.
 fn band(
-    confirmed: &[RowFrame],
-    frame: &[RowFrame],
+    confirmed: Hashed<'_>,
+    frame: Hashed<'_>,
     count: u16,
     named: &[PlannedRow],
     carried: &RowMask,
@@ -360,12 +398,14 @@ fn band(
         let last = count - lines;
         let mut row = 0;
         while row < last {
-            if frame[usize::from(row)] != confirmed[usize::from(row + lines)] {
+            if frame.hashes[usize::from(row)] != confirmed.hashes[usize::from(row + lines)] {
                 row += 1;
                 continue;
             }
             let top = row;
-            while row < last && frame[usize::from(row)] == confirmed[usize::from(row + lines)] {
+            while row < last
+                && frame.hashes[usize::from(row)] == confirmed.hashes[usize::from(row + lines)]
+            {
                 row += 1;
             }
             // One past the last row that matched, plus the shift: a band ends
@@ -377,7 +417,14 @@ fn band(
                 lines,
             };
             let found_cost = cost(found, named, carried);
-            if best.is_none_or(|(lowest, _)| found_cost < lowest) {
+            // The rows themselves, only where a band is about to be taken: a
+            // collision then costs one comparison of that band's own rows, and
+            // never a band applied to rows that did not move.
+            if best.is_none_or(|(lowest, _)| found_cost < lowest)
+                && (top..row).all(|at| {
+                    frame.rows[usize::from(at)] == confirmed.rows[usize::from(at + lines)]
+                })
+            {
                 best = Some((found_cost, found));
             }
         }
@@ -406,6 +453,61 @@ fn cost(band: ScrollBand, named: &[PlannedRow], carried: &RowMask) -> usize {
 fn within(named: &[PlannedRow], top: u16, bottom: u16) -> usize {
     let from = named.partition_point(|one| one.row < top);
     named[from..].partition_point(|one| one.row < bottom)
+}
+
+/// One hash per row, into the buffer the ledger keeps for it.
+fn hash_rows(into: &mut Vec<u64>, rows: &[RowFrame]) {
+    into.clear();
+    into.extend(rows.iter().map(row_hash));
+}
+
+/// One round of an FxHash-style mix: rotate so what came before leaves the low
+/// lanes, then one multiply to spread this word across all of them.
+const fn mix(hash: u64, word: u64) -> u64 {
+    (hash.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95)
+}
+
+/// A row's whole content in one word.
+///
+/// Written here rather than taken from `std`: `DefaultHasher` is `SipHash`, a
+/// keyed MAC, and this runs over every row of the grid on the actor thread.
+/// There is no adversary to key against, and a collision costs exactly the one
+/// confirmation [`band`] makes before it keeps a candidate.
+fn row_hash(row: &RowFrame) -> u64 {
+    let (words, remainder) = row.text.as_bytes().as_chunks::<8>();
+    let mut hash = u64::from(row.cells);
+    for word in words {
+        hash = mix(hash, u64::from_ne_bytes(*word));
+    }
+    // A byte at a time and tagged: untagged, a row and the same row with a
+    // trailing NUL pad into the same final word.
+    for &byte in remainder {
+        hash = mix(hash, u64::from(byte) | 0x100);
+    }
+    for run in &row.runs {
+        hash = mix(hash, u64::from(run.cells) | (u64::from(run.bytes) << 16));
+        hash = mix(hash, style_key(run.style));
+    }
+    hash
+}
+
+/// One style in one word, folded rather than packed: three colours are 96 bits
+/// and this is a hash, not an encoding.
+fn style_key(style: CellStyle) -> u64 {
+    let colour = |color: StyleColor| -> u64 {
+        match color {
+            StyleColor::Default => 0,
+            StyleColor::Palette(index) => (1 << 24) | u64::from(index),
+            StyleColor::Rgb(red, green, blue) => {
+                (2 << 24) | (u64::from(red) << 16) | (u64::from(green) << 8) | u64::from(blue)
+            }
+        }
+    };
+    colour(style.fg).rotate_left(21)
+        ^ colour(style.bg).rotate_left(42)
+        ^ colour(style.underline_color)
+        ^ (u64::from(style.attrs.bits()) << 56)
+        ^ (u64::from(style.underline.to_wire()) << 48)
 }
 
 /// Copy `rows` into a buffer that already holds a screen of the same shape.
@@ -805,6 +907,62 @@ mod tests {
         assert!(plan.full, "50 differing rows cost more than the screen");
     }
 
+    /// A TUI that repaints most of its screen without scrolling — htop, a
+    /// dashboard, `vim :redraw` — is the case the band search cannot cut short,
+    /// because no candidate is ever found to stop it. It still has to answer
+    /// `None` and leave the delta the row comparison already built.
+    #[test]
+    fn a_redraw_that_scrolled_nothing_finds_no_band() {
+        let (mut ledger, _) = confirmed(lines(0, 50));
+        let mut rows = lines(0, 50);
+        for (at, slot) in rows.iter_mut().enumerate().take(30) {
+            *slot = row(&format!("repainted {at}"));
+        }
+        let screen = frame(rows);
+        ledger.note_damage(&RowMask::filled(50));
+        let plan = plan_at(&mut ledger, &screen, second());
+        assert_eq!(plan.scroll, None, "nothing moved");
+        assert!(!plan.full, "30 of 50 rows is still a delta");
+        assert_eq!(named_rows(plan), (0..30).collect::<Vec<_>>());
+    }
+
+    /// `confirmed_rows` moves only on a confirmation or an invalidation, so
+    /// the hashes over it are a cache of that screen and not per-call scratch:
+    /// a sync burst plans up to sixty times between two confirmations.
+    #[test]
+    fn a_second_plan_against_an_unchanged_confirmed_screen_does_not_hash_it_again() {
+        let (mut ledger, mut screen) = confirmed(lines(0, 50));
+        screen.rows[3] = row("changed");
+        screen.rows[4] = row("changed too");
+        ledger.note_damage(&dirty(50, &[3, 4]));
+        assert_eq!(
+            plan_at(&mut ledger, &screen, second()).rows.len(),
+            2,
+            "the first plan did not reach the band search"
+        );
+        assert_eq!(
+            ledger.confirmed_hashes.len(),
+            50,
+            "the band search hashed something other than the confirmed screen"
+        );
+        let poisoned = vec![0_u64; 50];
+        ledger.confirmed_hashes.clone_from(&poisoned);
+        assert_eq!(
+            plan_at(&mut ledger, &screen, second().next()).rows.len(),
+            2,
+            "the second plan did not reach the band search"
+        );
+        assert_eq!(
+            ledger.confirmed_hashes, poisoned,
+            "a screen no confirmation replaced was hashed a second time"
+        );
+        assert!(ledger.confirm(Generation::initial(), second().next()));
+        assert!(
+            ledger.confirmed_hashes.is_empty(),
+            "the cache outlived the rows it is over"
+        );
+    }
+
     /// Damage must survive a delta the client never confirms, or the
     /// emulator's state becomes hostage to the network.
     #[test]
@@ -1050,8 +1208,8 @@ mod tests {
         )
         .expect("a screen");
 
-        assert_eq!(whole_row[0].len(), 329);
-        assert_eq!(run_only[0].len(), 143);
+        assert_eq!(whole_row[0].len(), 321);
+        assert_eq!(run_only[0].len(), 141);
     }
 
     /// The cases a viewport rule never fires on and the band exists for: a

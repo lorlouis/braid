@@ -145,57 +145,66 @@ impl QueryFilter {
 
     /// Hand `bytes` to `emulator` and return what the client is sent.
     ///
-    /// The result borrows `bytes` when the chunk opened no sequence at all, and
-    /// `out` otherwise; `out` is the caller's reused buffer. A sequence still
-    /// unfinished when `bytes` ends is not written out: it stays buffered for
-    /// the next call, because whether to drop it is not known until the
-    /// emulator has seen its final byte.
+    /// The result borrows `bytes` for as long as the output is still a prefix
+    /// of it, which is every chunk that holds no query the emulator answered -
+    /// however many sequences it holds - and `out`, the caller's reused buffer,
+    /// from the first byte cut onwards. A sequence still unfinished when
+    /// `bytes` ends is not written out: it stays buffered for the next call,
+    /// because whether to drop it is not known until the emulator has seen its
+    /// final byte. That leaves the output a shorter prefix, which is still one.
     pub fn filter<'a, E: Emulator>(
         &mut self,
         bytes: &'a [u8],
         out: &'a mut Vec<u8>,
         emulator: &mut E,
     ) -> Result<&'a [u8], E::Error> {
-        // Bulk output opens no sequence: nothing to attribute, nothing to cut,
-        // and the client is sent the caller's own slice rather than a copy.
-        // The offset is carried into the loop rather than found again, which
-        // would rescan the whole run up to it.
-        let mut index = match self.scan {
-            Scan::Ground => match find_opener(bytes) {
+        let ground = matches!(self.scan, Scan::Ground);
+        // Bulk output opens no sequence at all: no state machine to run, and
+        // the emulator takes the whole chunk as one span. The offset is carried
+        // into the loop rather than found again, which would rescan the whole
+        // run up to it.
+        let mut index = if ground {
+            match find_opener(bytes) {
                 None => {
                     emulator.consume(bytes)?;
                     return Ok(bytes);
                 }
                 Some(opener) => opener,
-            },
-            _ => 0,
+            }
+        } else {
+            0
         };
-        out.clear();
-        out.extend_from_slice(&bytes[..index]);
+        // A sequence carried in from the last chunk is output this chunk does
+        // not hold, so no prefix of it can be the answer here.
+        let mut out = if ground {
+            Out::borrowed(bytes, out, index)
+        } else {
+            Out::copied(bytes, out)
+        };
         // Bytes of this chunk the emulator has not been given yet. Every byte
         // is handed over exactly once, in order; the spans only decide how
         // finely a reply can be attributed.
         let mut unfed = 0;
         while index < bytes.len() {
             // Even a screen dense in escape sequences is mostly the text
-            // between them, and that text is a copy, not a decision.
+            // between them, and that text is passed through, not decided.
             if matches!(self.scan, Scan::Ground) {
                 let Some(opener) = find_opener(&bytes[index..]) else {
-                    out.extend_from_slice(&bytes[index..]);
+                    out.run(index, bytes.len());
                     break;
                 };
-                out.extend_from_slice(&bytes[index..index + opener]);
+                out.run(index, index + opener);
                 index += opener;
             }
-            match self.step(bytes[index], out) {
+            match self.step(bytes[index], &mut out) {
                 Mark::Consumed => index += 1,
                 Mark::Boundary => {
                     index += 1;
-                    self.settle(&bytes[unfed..index], out, emulator)?;
+                    self.settle(&bytes[unfed..index], &mut out, emulator)?;
                     unfed = index;
                 }
                 Mark::OpenerHere => {
-                    self.settle(&bytes[unfed..index], out, emulator)?;
+                    self.settle(&bytes[unfed..index], &mut out, emulator)?;
                     unfed = index;
                     self.open();
                     index += 1;
@@ -203,21 +212,21 @@ impl QueryFilter {
                 Mark::OpenerHeld => {
                     // The `ESC` closing the buffer belongs to what comes next,
                     // not to the sequence it broke off.
-                    self.unhold(out);
-                    self.settle(&bytes[unfed..index], out, emulator)?;
+                    self.unhold(&mut out);
+                    self.settle(&bytes[unfed..index], &mut out, emulator)?;
                     unfed = index;
                     self.open();
                 }
             }
         }
-        // The tail: ordinary output already in `out`, and at most one sequence
+        // The tail: ordinary output already written, and at most one sequence
         // still open, whose bytes stay held for the chunk that finishes it. Its
         // answer is carried rather than discarded, because the emulator may
         // have replied to what it has seen of the sequence so far.
         if unfed < bytes.len() {
             self.answered |= emulator.consume(&bytes[unfed..])? == Answer::Replied;
         }
-        Ok(out.as_slice())
+        Ok(out.finish())
     }
 
     /// Whether a byte can open something the emulator might answer.
@@ -229,7 +238,7 @@ impl QueryFilter {
         matches!(byte, Self::ESC | Self::ENQ)
     }
 
-    fn step(&mut self, byte: u8, out: &mut Vec<u8>) -> Mark {
+    fn step(&mut self, byte: u8, out: &mut Out<'_>) -> Mark {
         match self.scan {
             Scan::Ground => match byte {
                 // A one-byte query. Held like any other sequence so that the
@@ -243,7 +252,7 @@ impl QueryFilter {
                     Mark::Consumed
                 }
                 _ => {
-                    out.push(byte);
+                    out.byte(byte);
                     Mark::Consumed
                 }
             },
@@ -333,7 +342,7 @@ impl QueryFilter {
     }
 
     /// Buffer one byte of the sequence being scanned, keeping the buffer bounded.
-    fn hold(&mut self, byte: u8, out: &mut Vec<u8>) {
+    fn hold(&mut self, byte: u8, out: &mut Out<'_>) {
         if !self.overrun && self.pending.len() < SCAN_LIMIT {
             self.pending.push(byte);
             return;
@@ -343,18 +352,18 @@ impl QueryFilter {
             // the rest through as plain bytes. Nothing an emulator answers is
             // four kilobytes long.
             self.overrun = true;
-            out.append(&mut self.pending);
+            out.pass(&mut self.pending);
         }
-        out.push(byte);
+        out.byte(byte);
     }
 
     /// Take back the byte [`hold`](Self::hold) last placed: an `ESC` that turns
-    /// out to open the next sequence rather than close this one. It went to
-    /// `out` rather than `pending` if the sequence had already overrun, and
+    /// out to open the next sequence rather than close this one. It went to the
+    /// output rather than to `pending` if the sequence had already overrun, and
     /// popping the wrong one of the two sends the client an `ESC` twice.
-    fn unhold(&mut self, out: &mut Vec<u8>) {
+    fn unhold(&mut self, out: &mut Out<'_>) {
         if self.overrun {
-            out.pop();
+            out.unwrite();
         } else {
             self.pending.pop();
         }
@@ -365,20 +374,124 @@ impl QueryFilter {
     fn settle<E: Emulator>(
         &mut self,
         span: &[u8],
-        out: &mut Vec<u8>,
+        out: &mut Out<'_>,
         emulator: &mut E,
     ) -> Result<(), E::Error> {
         let answered = emulator.consume(span)? == Answer::Replied || self.answered;
-        // An overran sequence is already in `out` byte by byte, so `pending` is
-        // empty and there is nothing left to drop even if the emulator answered.
-        if !answered {
-            out.extend_from_slice(&self.pending);
+        if answered {
+            // An overran sequence is already in the output byte by byte, so
+            // `pending` is empty and there is nothing left to drop: this is the
+            // one place the output stops being what arrived.
+            if !self.pending.is_empty() {
+                out.diverge();
+            }
+        } else {
+            out.pass(&mut self.pending);
         }
         self.scan = Scan::Ground;
         self.pending.clear();
         self.overrun = false;
         self.answered = false;
         Ok(())
+    }
+}
+
+/// What the client is sent: still a prefix of the chunk that arrived, or a copy
+/// of it in the caller's buffer.
+///
+/// The filter drops bytes at exactly one place - a sequence the emulator
+/// answered - and a chunk dense in `ESC` almost never holds one: a colourised
+/// `ls`, a `vim` redraw, an SGR-laden prompt. Rebuilding those byte for byte to
+/// hand back what already arrived is a 64 KiB copy per PTY read for nothing, so
+/// the output is *named* - `kept` leading bytes of the chunk - until a byte is
+/// genuinely cut, and only built from there on.
+struct Out<'a> {
+    chunk: &'a [u8],
+    buffer: &'a mut Vec<u8>,
+    /// Leading bytes of `chunk` that are the output, while it is still one.
+    kept: usize,
+    copying: bool,
+}
+
+impl<'a> Out<'a> {
+    /// The output starts as `chunk[..kept]`, the run the caller has already
+    /// scanned past.
+    fn borrowed(chunk: &'a [u8], buffer: &'a mut Vec<u8>, kept: usize) -> Self {
+        Self {
+            chunk,
+            buffer,
+            kept,
+            copying: false,
+        }
+    }
+
+    fn copied(chunk: &'a [u8], buffer: &'a mut Vec<u8>) -> Self {
+        buffer.clear();
+        Self {
+            chunk,
+            buffer,
+            kept: 0,
+            copying: true,
+        }
+    }
+
+    /// The output stops being a slice of the chunk here, so what was named so
+    /// far has to be built before anything else is written.
+    fn diverge(&mut self) {
+        if !self.copying {
+            self.buffer.clear();
+            self.buffer.extend_from_slice(&self.chunk[..self.kept]);
+            self.copying = true;
+        }
+    }
+
+    /// The ordinary text `chunk[from..to]`, which while borrowed is already
+    /// where it belongs and only moves the count.
+    fn run(&mut self, from: usize, to: usize) {
+        if self.copying {
+            self.buffer.extend_from_slice(&self.chunk[from..to]);
+        } else {
+            debug_assert_eq!(self.kept, from, "a borrowed output is a prefix");
+            self.kept = to;
+        }
+    }
+
+    /// One byte of the chunk, passed through where it stands.
+    fn byte(&mut self, byte: u8) {
+        if self.copying {
+            self.buffer.push(byte);
+        } else {
+            debug_assert_eq!(self.chunk.get(self.kept), Some(&byte));
+            self.kept += 1;
+        }
+    }
+
+    /// Take back the byte [`byte`](Self::byte) last wrote.
+    fn unwrite(&mut self) {
+        if self.copying {
+            self.buffer.pop();
+        } else {
+            self.kept -= 1;
+        }
+    }
+
+    /// A held sequence passing through unchanged. Its bytes are the chunk's
+    /// own and sit right where the count already is.
+    fn pass(&mut self, held: &mut Vec<u8>) {
+        if self.copying {
+            self.buffer.append(held);
+        } else {
+            self.kept += held.len();
+            held.clear();
+        }
+    }
+
+    fn finish(self) -> &'a [u8] {
+        if self.copying {
+            self.buffer
+        } else {
+            &self.chunk[..self.kept]
+        }
     }
 }
 
@@ -612,6 +725,49 @@ mod tests {
             "a copy was made"
         );
         assert!(out.is_empty(), "the buffer was touched on the fast path");
+    }
+
+    /// A redraw is dense in `ESC` and holds no query at all, and this filter
+    /// drops bytes only where the emulator answered one. Rebuilding such a
+    /// chunk to hand back what already arrived is a copy of every colourised
+    /// `ls`, `vim` redraw and SGR-laden prompt the session carries.
+    #[test]
+    fn a_chunk_dense_in_sgr_and_holding_no_query_is_not_copied() {
+        let mut painted = Vec::new();
+        for row in 1..=24 {
+            painted.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+            painted.extend_from_slice(b"\x1b[38;5;33m\x1b[1mcolumn\x1b[0m one\r\n");
+        }
+        // A sequence the next chunk finishes shortens the prefix without
+        // making it a copy.
+        painted.extend_from_slice(b"\x1b[?2");
+
+        let mut filter = QueryFilter::new();
+        let mut out = Vec::new();
+        let kept = filter
+            .filter(&painted, &mut out, &mut Live::new())
+            .expect("the emulator accepts its own output");
+        assert!(
+            std::ptr::eq(kept.as_ptr(), painted.as_ptr()),
+            "a screen holding no query was rebuilt"
+        );
+        assert_eq!(kept.len(), painted.len() - filter.held());
+        assert!(out.is_empty(), "the buffer was written for nothing");
+
+        // One answered query is the whole difference: from there the output diverges
+        // from what arrived, and has to be built.
+        let mut queried = painted[..painted.len() - 4].to_vec();
+        queried.extend_from_slice(b"\x1b[ctail");
+        let mut filter = QueryFilter::new();
+        let mut out = Vec::new();
+        let kept = filter
+            .filter(&queried, &mut out, &mut Live::new())
+            .expect("the emulator accepts its own output");
+        assert!(
+            !std::ptr::eq(kept.as_ptr(), queried.as_ptr()),
+            "the DA1 was handed to the client"
+        );
+        assert_eq!(kept.len(), queried.len() - b"\x1b[c".len());
     }
 
     /// An unterminated control string must not hold the client's screen back.

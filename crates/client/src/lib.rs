@@ -1,4 +1,7 @@
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid`: `IP_DONTFRAG` and `IPV6_DONTFRAG` have no safe
+// binding and `forbid` here could not be lifted for the one call that needs
+// them. Every module but `dgram`, which holds that call, carries its own `forbid`.
+#![deny(unsafe_code)]
 
 pub mod forward;
 pub mod manage;
@@ -17,8 +20,8 @@ mod terminal;
 
 use braid_proto::{
     ClientMessage, CmdSeq, DatagramOffer, DetachReason, GridSize, MAX_ENV, MAX_FRAME,
-    MAX_OUTPUT_CHUNK, MAX_TERM, RejectReason, ServerMessage, SessionEnv, SessionId, Version,
-    VersionRange, read_frame, write_message,
+    MAX_OUTPUT_CHUNK, MAX_TERM, OutputRef, RejectReason, ServerMessage, SessionEnv, SessionId,
+    Version, VersionRange, peek_output, read_frame, write_message,
 };
 use forward::{ForwardSpec, Forwards, Listeners};
 use inbound::{
@@ -26,7 +29,7 @@ use inbound::{
     datagrams_wanted, next_frame, place_output, reorder_deadline, silence_deadline, take_offer,
 };
 use log::log;
-use outbound::{Accepted, Checkpoint, ClientWriter, FrameSink, Link, MIN_RESEND};
+use outbound::{Accepted, Checkpoint, ClientWriter, FrameSink, Link};
 use predict::{Prediction, Typing};
 use state::{CLIENT_ID, ReconnectState, reconnect_path};
 use std::io::{self, Read, Write};
@@ -531,9 +534,15 @@ fn upgrade(
     thread::Builder::new()
         .name("brd-resend".into())
         .spawn(staked(Stake::Session, move || {
-            // `retransmit` answers `None` for a transport that retransmits for itself.
-            while let Ok(Some(wait)) = resending.retransmit(Instant::now(), epoch) {
-                thread::sleep(wait.max(MIN_RESEND));
+            // `Done` is a link that retransmits for itself or one a later
+            // upgrade replaced. `Idle` is an empty journal, which nothing
+            // but the next message put on it can make due — and a timer
+            // there is twenty wakeups a second for an idle session, each
+            // taking the mutex a keystroke waits on.
+            while let Ok(next) = resending.retransmit(Instant::now(), epoch) {
+                if !resending.park(epoch, next) {
+                    break;
+                }
             }
         }))
         .map_err(|_| io::Error::other("resend thread failed"))?;
@@ -726,15 +735,16 @@ pub fn run(
     let mut window = expected.checked_add(CONSUMED_STRIDE).unwrap_or(expected);
     // Read from the last `Ping` rather than from under the writer's lock per held chunk.
     let mut srtt = None;
-    // Reused: a frame per keystroke echo otherwise costs a fresh zeroed allocation.
-    let mut payload = Vec::new();
+    // Reused: a frame per keystroke echo otherwise costs a fresh zeroed allocation. Only
+    // a deflated datagram body is written here; a stored one is read where it landed.
+    let mut scratch = Vec::new();
     // Output the session says this client will never be handed, summed over every
     // resume this process makes. Reported on the way out rather than mid-session:
     // this thread is in raw mode and owns no row it could print a notice on.
     let mut skipped = 0_u64;
     loop {
-        match next_frame(&mut inbound, &mut payload, &display) {
-            Ok(()) => {}
+        let frame = match next_frame(&mut inbound, &mut scratch, &display) {
+            Ok(frame) => frame,
             Err(error) if error.is_transport_loss() => {
                 // No short circuit for a close already asked for: the daemon drops
                 // the attachment as it ends the session, so the loss racing the
@@ -809,60 +819,72 @@ pub fn run(
                 continue;
             }
             Err(error) => return Err(ClientError::Protocol(error)),
-        }
-        match ServerMessage::decode(&payload, version)? {
-            ServerMessage::Output {
+        };
+        // `Output` is the shape the PTY's bytes travel on, so it is read straight out of
+        // the frame the reader still holds: the owning decode copies up to
+        // `MAX_OUTPUT_CHUNK` into a buffer this loop uses by reference and drops one
+        // statement later. Everything else falls through to the generated decoder.
+        if let Some(peeked) = peek_output(frame) {
+            let OutputRef {
                 off,
-                bytes,
                 cue,
                 echo_ack,
-            } => {
-                // On a datagram link a chunk out of place is far more often the one behind
-                // it overtaking than the one behind it lost, so only a gap too wide or too
-                // old to be a reorder asks for a screen, and then exactly once.
-                if place_output(expected, off, bytes.len()).is_none() {
-                    let now = Instant::now();
-                    if off.get() >= expected.get() {
-                        reorder.hold(off, bytes, cue, echo_ack, now);
-                    }
-                    if reorder.lost(now, reorder_deadline(srtt)) {
-                        reorder.clear();
-                        input.request_repaint()?;
-                    }
-                    continue;
+                bytes,
+            } = peeked?;
+            // On a datagram link a chunk out of place is far more often the one behind
+            // it overtaking than the one behind it lost, so only a gap too wide or too
+            // old to be a reorder asks for a screen, and then exactly once.
+            if place_output(expected, off, bytes.len()).is_none() {
+                let now = Instant::now();
+                if off.get() >= expected.get() {
+                    // The one branch that outlives the frame, so the one that owns.
+                    reorder.hold(off, bytes.to_vec(), cue, echo_ack, now);
                 }
-                let mut chunk = Some((bytes, cue, echo_ack));
-                while let Some((bytes, cue, echo_ack)) = chunk.take() {
+                if reorder.lost(now, reorder_deadline(srtt)) {
+                    reorder.clear();
+                    input.request_repaint()?;
+                }
+                continue;
+            }
+            if let Some(next) = expected.checked_add(bytes.len()) {
+                if display.lock()?.output(bytes, cue, echo_ack)? {
+                    input.request_repaint()?;
+                }
+                expected = next;
+                state.note_output(expected);
+                // What the gap was holding follows it, and those chunks are owned.
+                while let Some((bytes, cue, echo_ack)) = reorder.take(expected) {
                     let Some(next) = expected.checked_add(bytes.len()) else {
                         break;
                     };
-                    let repair = display.lock()?.output(&bytes, cue, echo_ack)?;
-                    if repair {
+                    if display.lock()?.output(&bytes, cue, echo_ack)? {
                         input.request_repaint()?;
                     }
                     expected = next;
                     state.note_output(expected);
-                    chunk = reorder.take(expected);
-                }
-                // Opened as the terminal drains rather than when the server next probes.
-                if expected.get() >= window.get() {
-                    input.consumed(expected)?;
-                    window = expected.checked_add(CONSUMED_STRIDE).unwrap_or(expected);
-                }
-                // A checkpoint is an `fsync`, so the terminal is drained before one.
-                if painted || checkpoint.due() {
-                    display.lock()?.flush()?;
-                }
-                if painted {
-                    // Once per burst, not once per frame — the write is an fsync, and doing
-                    // it per screen stalls this loop badly enough that a session under
-                    // backpressure stops draining (`e2e.py`'s flood check).
-                    painted = false;
-                    checkpoint.force(&state);
-                } else {
-                    checkpoint.note(&state);
                 }
             }
+            // Opened as the terminal drains rather than when the server next probes.
+            if expected.get() >= window.get() {
+                input.consumed(expected)?;
+                window = expected.checked_add(CONSUMED_STRIDE).unwrap_or(expected);
+            }
+            // A checkpoint is an `fsync`, so the terminal is drained before one.
+            if painted || checkpoint.due() {
+                display.lock()?.flush()?;
+            }
+            if painted {
+                // Once per burst, not once per frame — the write is an fsync, and doing
+                // it per screen stalls this loop badly enough that a session under
+                // backpressure stops draining (`e2e.py`'s flood check).
+                painted = false;
+                checkpoint.force(&state);
+            } else {
+                checkpoint.note(&state);
+            }
+            continue;
+        }
+        match ServerMessage::decode(frame, version)? {
             ServerMessage::Screen { part } => {
                 // Bound to a statement, not left as a match scrutinee: a temporary there
                 // lives to the end of the match, so the arms below would take the outbound
@@ -998,8 +1020,11 @@ pub fn run(
                 }
             }
             // `Hello` is answered before this loop; lists and searches get their own
-            // management connection.
-            ServerMessage::Hello { .. }
+            // management connection. `Output` is peeked out of the frame above, so the
+            // owning decoder answering for one means the two disagree about a tag —
+            // `a_peeked_output_matches_the_owning_decode` is what keeps that unreachable.
+            ServerMessage::Output { .. }
+            | ServerMessage::Hello { .. }
             | ServerMessage::HelloForward { .. }
             | ServerMessage::SessionList { .. }
             | ServerMessage::SearchResults { .. } => {
@@ -1144,12 +1169,13 @@ mod tests {
     };
     use inbound::{MAX_LINK_TIMEOUT, MAX_REORDER_WAIT, MIN_LINK_TIMEOUT, MIN_REORDER_WAIT};
     use journal::{CommandJournal, JournalError};
-    use outbound::{Carriage, INITIAL_RESEND, Progress, Resend};
+    use outbound::{Carriage, INITIAL_RESEND, Progress, Resend, Resending};
     use state::{REMEMBERED_SESSIONS, load_sessions, save_sessions, state_root, sweep_staging};
     use std::fmt::Write as _;
     use std::fs;
     use std::io::Cursor;
     use std::path::PathBuf;
+    use std::sync::mpsc;
     use terminal::{BLIND_RESET, install_panic_hook};
 
     /// Three of these carry text this process did not write.
@@ -1730,21 +1756,23 @@ mod tests {
     fn an_acknowledged_input_buffer_carries_the_next_keystroke() {
         let writer = stream_writer();
         writer.input(b"a").expect("typing is queued");
-        assert_eq!(
-            writer.state.lock().expect("writer lock").spare.capacity(),
-            0,
-            "nothing has been retired yet, so the first keystroke allocates"
+        writer.input(b"b").expect("typing is queued");
+        assert!(
+            writer.state.lock().expect("writer lock").spare.is_empty(),
+            "nothing has been retired yet, so the first keystrokes allocate"
         );
         writer.acknowledge(seq(1)).expect("the ack lands");
-        assert!(
-            writer.state.lock().expect("writer lock").spare.capacity() > 0,
-            "the retired command handed its buffer back"
-        );
-        writer.input(b"b").expect("typing is queued");
+        writer.acknowledge(seq(2)).expect("and the next one");
         assert_eq!(
-            writer.state.lock().expect("writer lock").spare.capacity(),
-            0,
-            "and the next keystroke took it rather than allocating again"
+            writer.state.lock().expect("writer lock").spare.len(),
+            2,
+            "a pool rather than one slot: the second retirement kept the first"
+        );
+        writer.input(b"c").expect("typing is queued");
+        assert_eq!(
+            writer.state.lock().expect("writer lock").spare.len(),
+            1,
+            "and the next keystroke took one rather than allocating again"
         );
     }
 
@@ -2093,6 +2121,54 @@ mod tests {
         assert!(
             unrelated.exists(),
             "the sweep is staging files and nothing else"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The write path creates this 0600 because the bytes are a bearer token for
+    /// a live session; one that is no longer 0600 is not one to resume from.
+    #[test]
+    fn a_resume_state_file_another_user_could_read_is_not_loaded() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, path) = state_file("mode");
+        let _ = fs::remove_dir_all(&root);
+        let state = ReconnectState::new(SessionId::from_bytes([5; 16]), capability(6));
+        save_sessions(&path, &[state]).expect("written");
+        assert_eq!(load_sessions(&path).expect("readable").len(), 1);
+
+        fs::set_permissions(&path, PermissionsExt::from_mode(0o644)).expect("loosen it");
+        assert!(
+            load_sessions(&path).expect("readable").is_empty(),
+            "a capability every local user can read was handed back to the session"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The sweep and the load both run inside this directory, and the tree is
+    /// repaired rather than refused, so a pre-v7 one is expected in the field:
+    /// the repair has to happen before either of them, not before the next write.
+    #[test]
+    fn a_checkpoint_makes_its_tree_private_before_it_reads_anything_out_of_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, path) = state_file("private");
+        let _ = fs::remove_dir_all(&root);
+        let reconnect = path.parent().expect("a directory").to_path_buf();
+        fs::create_dir_all(&reconnect).expect("a pre-v7 tree");
+        fs::set_permissions(&reconnect, PermissionsExt::from_mode(0o755)).expect("loosen it");
+
+        let checkpoint = Checkpoint::new(Some(path));
+        assert!(
+            checkpoint.path.is_some(),
+            "an owned tree is repaired, not refused"
+        );
+        let mode = fs::symlink_metadata(&reconnect)
+            .expect("the tree is still there")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "the sweep ran inside a directory anyone could plant a symlink in"
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -2626,7 +2702,7 @@ mod tests {
             writer
                 .retransmit(Instant::now() + INITIAL_RESEND * 8, writer.epoch())
                 .expect("the timer runs"),
-            None,
+            Resending::Done,
             "the timer has nothing to do on a transport that retransmits"
         );
         assert_eq!(messages(&written(&writer)).len(), 1);
@@ -2645,15 +2721,73 @@ mod tests {
         let due = Instant::now() + INITIAL_RESEND * 8;
         assert_eq!(
             writer.retransmit(due, stale).expect("the timer runs"),
-            None,
+            Resending::Done,
             "the thread spawned for the old link is still resending against it"
         );
         assert!(
-            writer
-                .retransmit(due, writer.epoch())
-                .expect("the timer runs")
-                .is_some(),
+            matches!(
+                writer
+                    .retransmit(due, writer.epoch())
+                    .expect("the timer runs"),
+                Resending::Due(_)
+            ),
             "and the one spawned for the link that is up has been retired with it"
+        );
+    }
+
+    /// Every other thread in this client parks properly. A deadline over an
+    /// empty journal made this one wake twenty times a second for the life of an
+    /// idle attached session, each time taking the mutex `input` takes per
+    /// keystroke, on the laptop the whole tool is aimed at.
+    #[test]
+    fn an_empty_journal_parks_the_resend_thread_until_something_is_journalled() {
+        let writer = Arc::new(datagram_writer());
+        let epoch = writer.epoch();
+        assert_eq!(
+            writer
+                .retransmit(Instant::now(), epoch)
+                .expect("the timer runs"),
+            Resending::Idle,
+            "nothing is outstanding, so there is no deadline worth waking for"
+        );
+
+        let parking = Arc::clone(&writer);
+        let waking = thread::spawn(move || {
+            let started = Instant::now();
+            parking.park(epoch, Resending::Due(Duration::from_secs(5)));
+            started.elapsed()
+        });
+        // The park has to be under way, or this is a wake it never missed.
+        thread::sleep(Duration::from_millis(20));
+        writer.input(b"x").expect("typing is queued");
+        let waited = waking.join().expect("the parked thread wakes");
+        assert!(
+            waited < Duration::from_secs(1),
+            "a journalled message left the resend thread asleep for {waited:?}"
+        );
+
+        // Off the calling thread, because the failure this pins is a park that
+        // never returns rather than one that returns late.
+        let returns_at_once = |epoch: u64| {
+            let (done, parked) = mpsc::channel();
+            let checking = Arc::clone(&writer);
+            thread::spawn(move || {
+                checking.park(epoch, Resending::Idle);
+                let _ = done.send(());
+            });
+            parked.recv_timeout(Duration::from_secs(5)).is_ok()
+        };
+        assert!(
+            returns_at_once(epoch),
+            "a message journalled between the poll and the park it decided on \
+             notified a thread that was not waiting yet"
+        );
+        writer
+            .reopen(Recorder::datagram(), Version::LOCAL)
+            .expect("a session this client has never seen");
+        assert!(
+            returns_at_once(epoch),
+            "a resend thread whose link was replaced parked instead of retiring"
         );
     }
 
@@ -2740,12 +2874,13 @@ mod tests {
                 panic!("the first datagram carries the resume");
             };
             // A datagram knows its own length, so the stream's four-byte prefix comes off.
-            let mut resume = Vec::new();
-            braid_proto::wire::unpack(&buffer[frame], MAX_FRAME as usize, &mut resume)
-                .expect("a packed resume");
+            let mut scratch = Vec::new();
+            let resume =
+                braid_proto::wire::unpack(&buffer[frame], MAX_FRAME as usize, &mut scratch)
+                    .expect("a packed resume");
             assert!(
                 matches!(
-                    ClientMessage::decode(&resume, Version::LOCAL).expect("the resume decodes"),
+                    ClientMessage::decode(resume, Version::LOCAL).expect("the resume decodes"),
                     ClientMessage::Resume { .. }
                 ),
                 "the datagram path is entered as an ordinary resume"

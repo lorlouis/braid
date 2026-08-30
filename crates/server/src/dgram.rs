@@ -15,7 +15,7 @@ use braid_dgram::{
     BASE_DATAGRAM, ConnectionId, Endpoint, Fragmentation, MAX_DATAGRAM, Received, RootSecret,
     SendError, Stats,
 };
-use braid_proto::wire::{PACK_TAG, pack, unpack};
+use braid_proto::wire::{PACK_TAG, pack, store, unpack};
 use braid_proto::{
     ClientMessage, DatagramOffer, MAX_CLIENT_FRAME, MIN_DATAGRAM_FRAME, RejectReason,
     ServerMessage, Version, VersionRange,
@@ -35,7 +35,9 @@ const _: () = assert!(MIN_DATAGRAM_FRAME <= frame_budget(BASE_DATAGRAM - HEADER_
 
 const OFFER_LIFETIME: Duration = Duration::from_secs(30);
 
-/// The longest the transmit thread sleeps when nothing names a deadline.
+/// The longest the transmit thread sleeps while an offer or a parting connection
+/// is on the books: both are reaped on a timer of their own rather than by an
+/// endpoint naming one.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// A floor rather than zero: a connection that keeps naming *now* spins a core.
@@ -391,13 +393,32 @@ struct Clock {
 }
 
 impl Clock {
-    /// Sleep until `deadline`, or until something names an earlier one.
-    fn sleep_until(&self, deadline: Instant) {
+    /// Sleep until `deadline`, or until something names an earlier one. `None`
+    /// is a daemon with nothing to be awake for, which is where a per-user daemon
+    /// spends most of its life: it waits until something names a deadline.
+    fn sleep_until(&self, deadline: Option<Instant>) {
         let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
-        *next = Some(deadline);
+        // Merged rather than assigned: something may have named a deadline while
+        // the tick that produced this one ran, and with no poll interval left
+        // underneath there is nothing to come along and catch a lost wake-up.
+        // Floored here rather than at the end of the tick, because a merged
+        // deadline is exactly the one [`POLL_FLOOR`] exists for: a connection
+        // that keeps naming *now* would otherwise spin this thread.
+        let floor = Instant::now() + POLL_FLOOR;
+        *next = match (*next, deadline) {
+            (Some(named), Some(ours)) => Some(named.min(ours)),
+            (named, ours) => named.or(ours),
+        }
+        .map(|at| at.max(floor));
         loop {
-            let Some(target) = *next else { return };
+            let Some(target) = *next else {
+                next = self.wake.wait(next).unwrap_or_else(PoisonError::into_inner);
+                continue;
+            };
             let Some(left) = target.checked_duration_since(Instant::now()) else {
+                // Cleared on the way out, so the merge above starts from what was
+                // named while the next tick runs rather than from an instant past.
+                *next = None;
                 return;
             };
             let (guard, _) = self
@@ -1048,20 +1069,28 @@ impl DatagramListener {
             let deadline = self.tick(Instant::now(), &mut outbound, &mut wires);
             // Outside every lock: an `ENOBUFS` stall must not hold the map.
             outbound.flush(&self.socket);
-            // From the end of the tick: an earlier floor would name an instant past.
-            self.clock
-                .sleep_until(deadline.max(Instant::now() + POLL_FLOOR));
+            // The floor is the clock's: a deadline named while this tick ran is
+            // merged with the one it produced, and either may be an instant past.
+            self.clock.sleep_until(deadline);
         }
     }
 
-    /// One pass over every connection, and when the next one is owed.
+    /// One pass over every connection, and when the next one is owed. `None` when
+    /// nothing names an instant: a daemon nobody is attached to, and equally an
+    /// attached session whose endpoints owe nothing, has nothing to be awake for,
+    /// and waking four times a second for either keeps a laptop's package out of
+    /// deep idle for the daemon's whole life. Every edge that ends that state
+    /// already names a deadline — `offer` and `admit` are the only two ways a
+    /// connection comes into existence and both call [`Clock::advance`], and every
+    /// arrival advances it from what the endpoint owes for what it just heard — and
+    /// the send path names one per batch, so the poll interval does not stand in
+    /// for a probe timeout.
     fn tick(
         &self,
         now: Instant,
         outbound: &mut Outbound,
         wires: &mut Vec<Arc<Mutex<Wire>>>,
-    ) -> Instant {
-        let mut deadline = now + POLL_INTERVAL;
+    ) -> Option<Instant> {
         // A read guard is all a steady state needs: both maps below are empty
         // then, and a write guard shuts out the thread that receives for every
         // session for the whole walk, a parting connection's seal included.
@@ -1070,6 +1099,12 @@ impl DatagramListener {
             wires.extend(connections.live.values().map(|live| Arc::clone(&live.wire)));
             !connections.pending.is_empty() || !connections.parting.is_empty()
         };
+        if !owed && wires.is_empty() {
+            return None;
+        }
+        // Seeded only for the maps reaped on a timer; a live wire's ceiling is
+        // whatever its endpoint names, so an idle session sleeps on its own timers.
+        let mut deadline = owed.then(|| now + POLL_INTERVAL);
         if owed {
             let mut connections = self.write();
             let Connections {
@@ -1081,7 +1116,7 @@ impl DatagramListener {
                     // Dropping the entry scrubs its secret.
                     return false;
                 }
-                deadline = deadline.min(expires);
+                sooner(&mut deadline, expires);
                 true
             });
             parting.retain(|_, parting| {
@@ -1100,7 +1135,7 @@ impl DatagramListener {
                 // peer never acknowledged, and a window holding it refuses the farewell.
                 while outbound.seal(|out| endpoint.poll_transmit(now, out).map(|(to, _)| to)) {}
                 if let Some(next) = endpoint.poll_deadline() {
-                    deadline = deadline.min(next);
+                    sooner(&mut deadline, next);
                 }
                 if now >= parting.due {
                     if outbound.seal(|out| endpoint.send(body, now, out).ok()) {
@@ -1113,7 +1148,7 @@ impl DatagramListener {
                             .unwrap_or(now + FAREWELL_SPACING);
                     }
                 }
-                deadline = deadline.min(parting.due.min(parting.expires));
+                sooner(&mut deadline, parting.due.min(parting.expires));
                 parting.left > 0
             });
         }
@@ -1123,8 +1158,10 @@ impl DatagramListener {
             // Each poll produces at most one datagram, so this drains rather than spins.
             while outbound.seal(|out| endpoint.poll_transmit(now, out).map(|(to, _)| to)) {}
             if let Some(next) = endpoint.poll_deadline() {
-                deadline = deadline.min(next);
+                sooner(&mut deadline, next);
             }
+            // A tick runs only where something named an instant, which is also the
+            // only place the width this path carries can have moved.
             guard.publish();
         }
         deadline
@@ -1180,6 +1217,12 @@ impl Outbound {
         self.filled = 0;
         self.slots.truncate(OUTBOUND_SLOTS);
     }
+}
+
+/// Fold one named instant into the soonest a tick has been told about. `None` is
+/// nothing named rather than an instant, so the first fold is the one that decides.
+fn sooner(deadline: &mut Option<Instant>, next: Instant) {
+    *deadline = Some(deadline.map_or(next, |held| held.min(next)));
 }
 
 /// One connection's endpoint, whatever a panicked thread left: a half-sealed
@@ -1272,10 +1315,46 @@ fn is_farewell(payload: &[u8]) -> bool {
         .is_some_and(|tag| matches!(*tag, EXIT | REJECT | DETACHED))
 }
 
+/// Whether the window rather than the application is what paces this connection.
+/// Deflate costs 9.7 us on an MTU of shell output — a quarter of it zeroing the
+/// dictionary [`pack`]'s reused compressor cannot keep between calls — and buys
+/// about 3x on the wire. That is a trade worth making while the next frame is
+/// waiting on the window and a waste on a link with room to spare, so a frame
+/// that already fits the path is compressed only from half the window in flight,
+/// which is where the bytes saved start buying back the microseconds.
+fn squeezed(stats: &Stats) -> bool {
+    stats.bytes_in_flight * 2 >= stats.cwnd
+}
+
+/// What one frame's turn at the codec is worth, decided under a hold short enough
+/// not to stall the thread that receives for every session.
+#[derive(Clone, Copy)]
+enum Plan {
+    /// Already the datagram's own bytes: nothing left to compress, and the window
+    /// is asked about them under the second hold, at the size they will go out at.
+    Sealed,
+    /// Fits the path raw, and the window admitted it at that width under the first
+    /// hold. `deflate` is the CPU-for-bytes trade, and [`pack`] never answers wider
+    /// than the payload it was given, so the answer already given still holds.
+    Admitted { deflate: bool },
+    /// Wider than the path carries raw, so it is compressed and only then is the
+    /// window asked, at the one size that is honest for it.
+    Oversize,
+}
+
+impl Plan {
+    /// Whether the window still owes this frame an answer.
+    fn unasked(self) -> bool {
+        !matches!(self, Self::Admitted { .. })
+    }
+}
+
 /// Decode one datagram's body as a client message. `unpack` is the length check that
 /// matters: a datagram knows its own length, so what is bounded is what it inflates to.
-fn frame_message(body: &[u8], spoken: Version, payload: &mut Vec<u8>) -> Option<ClientMessage> {
-    unpack(body, MAX_CLIENT_FRAME as usize, payload).ok()?;
+/// The answer is borrowed — out of `body` for a stored payload, out of `scratch` for a
+/// deflated one — so the scratch is touched only when the codec had something to do.
+fn frame_message(body: &[u8], spoken: Version, scratch: &mut Vec<u8>) -> Option<ClientMessage> {
+    let payload = unpack(body, MAX_CLIENT_FRAME as usize, scratch).ok()?;
     ClientMessage::decode(payload, spoken).ok()
 }
 
@@ -1358,46 +1437,66 @@ impl DatagramWriter {
             outgrown,
             ..
         } = self;
+        // Recorded before anything can refuse it: a session that ends while its
+        // window is full would otherwise report a close it never transmitted.
+        let last = coding == Coding::Raw && is_farewell(payload);
+        // Two short holds with the codec between them rather than one hold across
+        // it. `pack` of an MTU of shell output is 9.7 us and a 64 KiB PTY read is
+        // fifty of those, while this is the mutex the one receive thread demuxes
+        // every session's datagrams behind - and an acknowledgement queued there
+        // is exactly what reopens the window this frame is about to be refused
+        // by. The window may move between the two holds, which is the refusal
+        // `send` already answers with `SendError::Blocked`.
+        let plan = match coding {
+            Coding::Packed => Plan::Sealed,
+            Coding::Raw => {
+                let guard = wire(held);
+                if guard.retired {
+                    return Err(io::Error::other("the datagram connection is gone"));
+                }
+                let endpoint = &guard.endpoint;
+                // The upper bound `pack` can produce.
+                let bound = payload.len() + PACK_TAG;
+                if bound > endpoint.payload_limit() {
+                    Plan::Oversize
+                } else {
+                    // A frame the *path* cannot carry must never park on the window;
+                    // one that fits raw is asked about before compressing, which the
+                    // window may waste.
+                    if !last && !endpoint.writable(now, bound) {
+                        return Ok(Sealing::Blocked);
+                    }
+                    Plan::Admitted {
+                        deflate: squeezed(&endpoint.stats()),
+                    }
+                }
+            }
+        };
+        let wire_bytes: &[u8] = match plan {
+            Plan::Sealed => payload,
+            Plan::Admitted { deflate: true } | Plan::Oversize => {
+                pack(payload, packed);
+                packed
+            }
+            Plan::Admitted { deflate: false } => {
+                store(payload, packed);
+                packed
+            }
+        };
         let to = {
             let mut guard = wire(held);
             if guard.retired {
                 return Err(io::Error::other("the datagram connection is gone"));
             }
-            // Recorded before anything can refuse it: a session that ends while its
-            // window is full would otherwise report a close it never transmitted.
-            let last = coding == Coding::Raw && is_farewell(payload);
             let Wire {
                 endpoint, farewell, ..
             } = &mut *guard;
-            let wire_bytes = match coding {
-                // Already the bytes the datagram carries, so there is nothing to
-                // estimate and nothing left to compress.
-                Coding::Packed => {
-                    if !endpoint.writable(now, payload.len()) {
-                        return Ok(Sealing::Blocked);
-                    }
-                    payload
-                }
-                Coding::Raw => {
-                    // The upper bound `pack` can produce.
-                    let bound = payload.len() + PACK_TAG;
-                    let fits_raw = bound <= endpoint.payload_limit();
-                    // A frame the *path* cannot carry must never park on the window;
-                    // one that fits raw is asked about before compressing, which the
-                    // window may waste.
-                    if !last && fits_raw && !endpoint.writable(now, bound) {
-                        return Ok(Sealing::Blocked);
-                    }
-                    pack(payload, packed);
-                    // One that does not fit raw was cut against what it compresses
-                    // to, so the packed size is the only honest thing to ask the
-                    // window about.
-                    if !last && !fits_raw && !endpoint.writable(now, packed.len()) {
-                        return Ok(Sealing::Blocked);
-                    }
-                    packed
-                }
-            };
+            // A frame the first hold did not ask about is asked about here, at the
+            // size it goes out at: what does not fit raw was cut against what it
+            // compresses to, and a packed payload arrived as the bytes it carries.
+            if !last && plan.unasked() && !endpoint.writable(now, wire_bytes.len()) {
+                return Ok(Sealing::Blocked);
+            }
             if last {
                 *farewell = Some(wire_bytes.to_vec());
             }
@@ -1467,6 +1566,14 @@ impl FrameWriter for DatagramWriter {
                     return Err(error);
                 }
             }
+        }
+        // Once per batch, as `deliver` does per datagram: a send arms the loss
+        // detector, and its probe timeout is smoothed + 4*var + the ack delay -
+        // tens of milliseconds on a LAN, which nothing else here would look at
+        // until the tick came round. One clock acquisition, outside the wire's.
+        let next = wire(&self.wire).endpoint.poll_deadline();
+        if let Some(next) = next {
+            self.listener.clock.advance(next);
         }
         if consumed > 0 {
             Ok(consumed)
@@ -1550,11 +1657,10 @@ mod tests {
                 else {
                     continue;
                 };
-                unpack(&datagram[range], MAX_FRAME as usize, &mut payload)
+                let body = unpack(&datagram[range], MAX_FRAME as usize, &mut payload)
                     .expect("a datagram body unpacks");
-                messages.push(
-                    ServerMessage::decode(&payload, Version::LOCAL).expect("a message decodes"),
-                );
+                messages
+                    .push(ServerMessage::decode(body, Version::LOCAL).expect("a message decodes"));
             }
             messages
         }
@@ -2251,8 +2357,127 @@ mod tests {
         let deadline = listener.tick(now, &mut Outbound::default(), &mut Vec::new());
 
         assert_eq!(
-            deadline, owed,
+            deadline,
+            Some(owed),
             "the tick slept past the deadline a parting endpoint named"
+        );
+    }
+
+    /// What the transmit thread would find on the clock, taken as it takes it.
+    fn woken(listener: &DatagramListener) -> bool {
+        listener
+            .clock
+            .next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .is_some()
+    }
+
+    /// The transmit thread's wake-ups are the whole cost of a daemon at rest, so
+    /// nothing attached must mean nothing to be awake for - and the one way an
+    /// offer comes into existence must name the deadline that prunes it.
+    #[test]
+    fn a_listener_with_no_connections_names_no_deadline() {
+        let listener = DatagramListener::bind().expect("a datagram socket");
+        assert_eq!(
+            listener.tick(Instant::now(), &mut Outbound::default(), &mut Vec::new()),
+            None,
+            "a daemon nobody is attached to wakes four times a second for ever"
+        );
+
+        listener.offer().expect("an offer");
+        assert!(
+            woken(&listener),
+            "an offer was minted against a thread that is asleep until something wakes it"
+        );
+        let now = Instant::now();
+        assert!(
+            listener
+                .tick(now, &mut Outbound::default(), &mut Vec::new())
+                .is_some_and(|deadline| deadline <= now + OFFER_LIFETIME),
+            "an offer that expires named no tick to prune it"
+        );
+    }
+
+    /// The same for one session at rest: what an attached connection owes is what
+    /// the thread wakes for, and a connection that owes nothing owes no wake-up.
+    #[test]
+    fn a_live_connection_owing_nothing_names_no_deadline() {
+        let listener = DatagramListener::bind().expect("a datagram socket");
+        let (tx, _rx) = mailbox();
+        let (_cid, _peer, shared) = live_connection(&listener, tx);
+        // One pass pays what the handshake left owed: the acknowledgement for the
+        // peer's first keystroke, and the first probe of the path it proved.
+        let mut outbound = Outbound::default();
+        listener.tick(Instant::now(), &mut outbound, &mut Vec::new());
+        outbound.flush(&listener.socket);
+        assert_eq!(
+            wire(&shared).endpoint.poll_deadline(),
+            None,
+            "an endpoint with a timer still running is not the case under test"
+        );
+
+        assert_eq!(
+            listener.tick(Instant::now(), &mut Outbound::default(), &mut Vec::new()),
+            None,
+            "an attached session at rest wakes the transmit thread four times a second"
+        );
+    }
+
+    /// Compression is worth its microseconds when the window is what the next
+    /// frame is waiting on, and not otherwise.
+    #[test]
+    fn the_codec_runs_only_while_the_window_is_pacing_the_link() {
+        let idle = Stats {
+            cwnd: 12_000,
+            bytes_in_flight: 1_200,
+            srtt: Some(Duration::from_millis(10)),
+            rttvar: Duration::from_millis(2),
+            plpmtu: 1_200,
+            lost: 0,
+            spurious: 0,
+        };
+        assert!(
+            !squeezed(&idle),
+            "a link with room to spare paid for deflate"
+        );
+        assert!(squeezed(&Stats {
+            bytes_in_flight: 6_000,
+            ..idle
+        }));
+        assert!(squeezed(&Stats {
+            bytes_in_flight: 12_000,
+            ..idle
+        }));
+    }
+
+    /// The frame still has to say which of the two it is, and the receiver still
+    /// has to read it back.
+    #[test]
+    fn a_frame_an_uncongested_path_carries_whole_goes_uncompressed() {
+        let listener = DatagramListener::bind().expect("a datagram socket");
+        let (tx, _rx) = mailbox();
+        let (cid, mut peer, shared) = live_connection(&listener, tx);
+        let mut writer = DatagramWriter::new(Arc::clone(&listener), cid, shared);
+        // Bytes deflate wins on by any measure, so a compressed frame is obvious.
+        let frame = output(vec![b'a'; 900]);
+
+        assert_eq!(
+            writer
+                .write_frames(&[IoSlice::new(&frame)], FrameSet::default())
+                .expect("the frame goes"),
+            frame.len()
+        );
+
+        assert_eq!(
+            writer.packed.len(),
+            frame.len() - FRAME_LENGTH_PREFIX + PACK_TAG,
+            "a frame the path carries whole was compressed anyway"
+        );
+        assert!(
+            matches!(peer.drain().as_slice(), [ServerMessage::Output { .. }]),
+            "the stored framing is not what the receiver unpacks"
         );
     }
 
@@ -2533,6 +2758,8 @@ mod tests {
             .encode(Version::LOCAL)
             .expect("a resume encodes");
         let mut datagram = sealed(&mut peer, &frame);
+        // The offer's own deadline, taken so the wake below is the admission's.
+        assert!(woken(&listener));
 
         listener.admit(
             &daemon,
@@ -2548,6 +2775,11 @@ mod tests {
         assert!(
             !listener.read().pending.contains_key(&cid),
             "the offer outlived the resume that spent it"
+        );
+        assert!(
+            woken(&listener),
+            "a connection admitted while the transmit thread slept owes a challenge \
+             nothing is awake to send"
         );
         assert!(
             matches!(
@@ -2665,7 +2897,7 @@ mod tests {
         let waking = Arc::clone(&clock);
         let started = Instant::now();
         let sleeper = thread::spawn(move || {
-            waking.sleep_until(started + Duration::from_secs(30));
+            waking.sleep_until(Some(started + Duration::from_secs(30)));
             Instant::now()
         });
         // The sleeper has to be inside `wait_timeout` for the notify to end it.
@@ -2677,6 +2909,32 @@ mod tests {
             woke.saturating_duration_since(started) < Duration::from_secs(1),
             "the tick slept through a deadline it was told about"
         );
+    }
+
+    /// A daemon nobody is attached to sleeps rather than polls, and comes out of
+    /// that sleep only when something names a deadline.
+    #[test]
+    fn an_unnamed_deadline_sleeps_until_one_is_named() {
+        let clock = Arc::new(Clock::default());
+        // A deadline already spent, where the last tick left it: an unbounded
+        // sleep that inherited it would spin the transmit thread instead.
+        clock.sleep_until(Some(Instant::now()));
+
+        let waking = Arc::clone(&clock);
+        let (woke, waited) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            waking.sleep_until(None);
+            let _ = woke.send(());
+        });
+        assert!(
+            waited.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the transmit thread woke with nothing to be awake for"
+        );
+
+        clock.advance(Instant::now());
+        waited
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a deadline named against a sleeping thread never reached it");
     }
 
     /// A number missing from this line is one nothing else in this daemon asks for.

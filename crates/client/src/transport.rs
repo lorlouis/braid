@@ -291,18 +291,33 @@ impl Outbox {
     }
 }
 
+/// Frames offered in one call, off the heap. The same fixed array the daemon's
+/// sink writes through, for the same reason.
+const VECTORED: usize = 64;
+
 /// One `write(2)` where it takes one: `ChildStdin` is unbuffered, so a frame at
 /// a time is a syscall apiece. Vectored rather than gathered because copying a
 /// paste is the larger half of the work.
 fn write_batch<W: Write>(output: &mut W, batch: &[Vec<u8>]) -> io::Result<()> {
-    let mut buffers: Vec<IoSlice<'_>> = batch.iter().map(|frame| IoSlice::new(frame)).collect();
-    let mut rest = &mut buffers[..];
-    while !rest.is_empty() {
-        match output.write_vectored(rest) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(count) => IoSlice::advance_slices(&mut rest, count),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+    // The steady state is one frame per burst, and a `writev` describing a
+    // single buffer is a `write` that allocated an iovec to say so.
+    if let [only] = batch {
+        output.write_all(only)?;
+        return output.flush();
+    }
+    for chunk in batch.chunks(VECTORED) {
+        let mut buffers = [IoSlice::new(&[]); VECTORED];
+        for (slot, frame) in buffers.iter_mut().zip(chunk) {
+            *slot = IoSlice::new(frame);
+        }
+        let mut rest = &mut buffers[..chunk.len()];
+        while !rest.is_empty() {
+            match output.write_vectored(rest) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(count) => IoSlice::advance_slices(&mut rest, count),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
         }
     }
     output.flush()
@@ -344,6 +359,14 @@ mod tests {
     /// mid-frame routinely and a mismeasured cursor repeats or drops a frame.
     #[test]
     fn a_short_write_neither_repeats_nor_drops_a_frame() {
+        let one = [b"just this one".to_vec()];
+        let mut pipe = Grudging {
+            taken: Vec::new(),
+            at_most: 3,
+        };
+        write_batch(&mut pipe, &one).expect("a grudging pipe still takes it all");
+        assert_eq!(pipe.taken, one[0], "the one-frame path lost a short write");
+
         let batch: Vec<Vec<u8>> = (0..6_u8)
             .map(|frame| vec![b'a' + frame; usize::from(frame) + 1])
             .collect();
@@ -357,6 +380,27 @@ mod tests {
             assert_eq!(
                 pipe.taken, whole,
                 "taking {at_most} bytes at a time changed the byte stream"
+            );
+        }
+    }
+
+    /// The slices live in a fixed stack array, so a burst past it goes out in
+    /// chunks and the seam between them is where a frame would go missing.
+    #[test]
+    fn a_burst_past_the_vectored_bound_still_goes_out_whole() {
+        let batch: Vec<Vec<u8>> = (0..VECTORED * 2 + 3)
+            .map(|frame| vec![u8::try_from(frame % 251).expect("in range"); 3])
+            .collect();
+        let whole: Vec<u8> = batch.concat();
+        for at_most in [1, 7, whole.len()] {
+            let mut pipe = Grudging {
+                taken: Vec::new(),
+                at_most,
+            };
+            write_batch(&mut pipe, &batch).expect("a grudging pipe still takes it all");
+            assert_eq!(
+                pipe.taken, whole,
+                "taking {at_most} bytes at a time lost a frame at a chunk boundary"
             );
         }
     }

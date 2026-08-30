@@ -187,7 +187,7 @@ report privately anything that breaks one.
 
 ## Status
 
-**Alpha.** The resilience contract is covered by 642 unit and integration tests, 14
+**Alpha.** The resilience contract is covered by 689 unit and integration tests, 14
 end-to-end suites driving a real client through a real PTY over an SSH loopback, a
 deterministic fault-injecting simulator, and 11 fuzz targets, all gated in CI on every
 pull request. That is evidence the invariants hold. It says nothing about the corners

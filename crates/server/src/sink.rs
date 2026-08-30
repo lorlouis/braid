@@ -42,6 +42,35 @@ pub(crate) fn recycle(spare: &mut Vec<Vec<u8>>, frame: Vec<u8>) {
     }
 }
 
+/// Screen pieces kept for the producer. A stream framing gives one screen a
+/// whole megabyte in a single piece, which [`recycle`] rightly refuses to keep
+/// sixty-four of; a pool two deep is the middle ground that rule cannot express,
+/// and two is what the hand-off holds - the piece being encoded and the piece the
+/// writer still has. A datagram's pieces are an MTU each and never come here.
+const SPARE_SCREENS: usize = 2;
+
+/// Keep a spent screen piece for the producer, under the pool's own bound. The
+/// one place [`SPARE_SCREENS`] is enforced, the way [`recycle`] owns
+/// [`SPARE_FRAMES`].
+fn keep_screen(screens: &mut Vec<Vec<u8>>, frame: Vec<u8>) {
+    if screens.len() < SPARE_SCREENS {
+        screens.push(frame);
+    }
+}
+
+/// Keep a spent buffer for the producer, in the pool its size belongs to: a
+/// stream framing's screen is one piece of up to a megabyte, which [`recycle`]
+/// refuses for the reason it exists. One rule for both ends of the hand-off,
+/// because a buffer the writer sorts one way and the encoder draws the other
+/// way is a pool that never fills and an allocation per repaint.
+pub(crate) fn keep(frames: &mut Vec<Vec<u8>>, screens: &mut Vec<Vec<u8>>, frame: Vec<u8>) {
+    if frame.capacity() > MAX_OUTPUT_CHUNK {
+        keep_screen(screens, frame);
+        return;
+    }
+    recycle(frames, frame);
+}
+
 /// Bytes of screen one attachment may hold waiting before the session is told
 /// it is composing too much. The lane is one slot deep, so [`STREAM_LIMIT`] has
 /// nothing to say about it, and a full repaint at `GridSize::MAX_COLS` by
@@ -178,6 +207,15 @@ impl Slot {
             Self::Screen => 0,
         }
     }
+
+    /// The buffer this entry carries, for a refused slot to give back to the
+    /// pool it was drawn from.
+    fn into_frame(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Stream(frame) | Self::Control(frame) | Self::Forward(frame) => Some(frame),
+            Self::Screen => None,
+        }
+    }
 }
 
 /// What the screen lane is costing the attachment holding one. Reported rather
@@ -221,6 +259,9 @@ struct Queue {
     /// Frame buffers the transport has finished with, waiting to be filled
     /// again by the session that encoded them.
     spare: Vec<Vec<u8>>,
+    /// The same for pieces too large for that pool, which is a stream framing's
+    /// screens and nothing else.
+    screens: Vec<Vec<u8>>,
     closed: bool,
 }
 
@@ -292,6 +333,46 @@ impl Queue {
             }
         }
         self.in_flight = true;
+    }
+
+    /// Return a superseded screen's pieces to the pools they were cut from:
+    /// superseding is how a screen leaves this lane for the slow client the
+    /// pools exist for.
+    fn recycle_pieces(&mut self) {
+        let Self {
+            pieces,
+            spare,
+            screens,
+            ..
+        } = self;
+        for piece in pieces.drain(..) {
+            keep(spare, screens, piece);
+        }
+    }
+
+    /// Charge one frame to its lane and put it in the order, or hand it back
+    /// refused. One accounting site for both lanes: a second beside this one is
+    /// how a lane ends up bounded by the other lane's number.
+    fn admit(&mut self, slot: Slot, limit: usize, position: Position) -> Result<(), Slot> {
+        let bytes = slot.bytes();
+        let forward = matches!(slot, Slot::Forward(_));
+        let lane = if forward {
+            &mut self.forward
+        } else {
+            &mut self.stream
+        };
+        if lane.charged().saturating_add(bytes) > limit {
+            return Err(slot);
+        }
+        lane.queued += bytes;
+        if forward {
+            self.forward_entries += 1;
+        }
+        match position {
+            Position::Back => self.order.push_back(slot),
+            Position::Front => self.order.push_front(slot),
+        }
+        Ok(())
     }
 }
 
@@ -533,8 +614,11 @@ impl Shared {
             queue.stream.release();
             queue.forward.release();
             queue.screen.release();
+            // Through the guard once: the two pools are disjoint fields, which
+            // a `DerefMut` at every use is not.
+            let queue = &mut *queue;
             for frame in batch.frames.drain(..) {
-                recycle(&mut queue.spare, frame);
+                keep(&mut queue.spare, &mut queue.screens, frame);
             }
         }
         batch.clear();
@@ -576,6 +660,7 @@ impl AttachmentSink {
                 forward: Lane::default(),
                 forward_entries: 0,
                 spare: Vec::new(),
+                screens: Vec::new(),
                 in_flight: false,
                 closed: false,
             }),
@@ -638,15 +723,39 @@ impl AttachmentSink {
     /// attachment also jump it: an `Exit` a client never learns about is the
     /// failure the reservation exists to prevent.
     pub fn send(&self, message: &ServerMessage) -> Result<(), SinkError> {
-        let frame = message
-            .encode(self.version)
-            .map_err(|_| SinkError::Unusable)?;
+        let shared = self.shared();
+        let mut queue = shared.queue.lock().map_err(|_| SinkError::Unusable)?;
+        if queue.closed {
+            return Err(SinkError::Unusable);
+        }
+        // From the pool the transport recycles into: a `CommandAck` is one
+        // control frame per keystroke per attachment and a `Ping` one per
+        // probe, each of them an allocation and a free beside sixty-four
+        // buffers sitting spare.
+        let mut frame = queue.spare.pop().unwrap_or_default();
+        if message.encode_into(self.version, &mut frame).is_err() {
+            recycle(&mut queue.spare, frame);
+            return Err(SinkError::Unusable);
+        }
         let position = if is_terminal(message) {
             Position::Front
         } else {
             Position::Back
         };
-        self.push(Slot::Control(frame), STREAM_LIMIT + CONTROL_SLACK, position)
+        match queue.admit(Slot::Control(frame), STREAM_LIMIT + CONTROL_SLACK, position) {
+            Ok(()) => {}
+            // Back to the pool rather than freed with the refusal: the buffer is
+            // this sink's either way.
+            Err(refused) => {
+                if let Some(frame) = refused.into_frame() {
+                    recycle(&mut queue.spare, frame);
+                }
+                return Err(SinkError::Full);
+            }
+        }
+        shared.publish(&queue);
+        shared.ready.notify_one();
+        Ok(())
     }
 
     /// Queue one encoded chunk of the byte stream. `Full` is the signal that
@@ -687,6 +796,7 @@ impl AttachmentSink {
         if queue.pieces.is_empty() {
             queue.order.push_back(Slot::Screen);
         }
+        queue.recycle_pieces();
         queue.screen.queued = cut.pieces.iter().map(Vec::len).sum();
         queue.pieces = cut.pieces;
         queue.coding = cut.coding;
@@ -716,23 +826,35 @@ impl AttachmentSink {
         let Ok(mut queue) = self.shared().queue.lock() else {
             return;
         };
+        // Through the guard once: the two pools and the order are disjoint
+        // fields, which a `DerefMut` at every use is not.
+        let queue = &mut *queue;
         let mut kept = 0;
-        queue.order.retain(|slot| match slot {
-            Slot::Stream(_) => false,
-            Slot::Control(frame) => {
-                kept += frame.len();
-                true
+        // Rotated rather than retained: a discard runs exactly as this
+        // attachment enters a sync episode and starts cutting screens out of
+        // these pools, so the quarter megabyte it drops is the buffers the
+        // screens replacing it are cut into.
+        for _ in 0..queue.order.len() {
+            let Some(slot) = queue.order.pop_front() else {
+                break;
+            };
+            match slot {
+                Slot::Stream(frame) => keep(&mut queue.spare, &mut queue.screens, frame),
+                Slot::Control(frame) => {
+                    kept += frame.len();
+                    queue.order.push_back(Slot::Control(frame));
+                }
+                // A forwarded byte cannot be regenerated and no screen carries
+                // one, so taking these would be silent data loss on a
+                // connection the user believes is intact.
+                slot @ (Slot::Forward(_) | Slot::Screen) => queue.order.push_back(slot),
             }
-            // A forwarded byte cannot be regenerated and no screen carries one,
-            // so taking these would be silent data loss on a connection the
-            // user believes is intact.
-            Slot::Forward(_) | Slot::Screen => true,
-        });
+        }
         // Recomputed rather than zeroed: the surviving control frames still
         // occupy the room the next `push` is measured against, and so does the
         // batch the writer is holding.
         queue.stream.queued = kept;
-        self.shared().publish(&queue);
+        self.shared().publish(queue);
     }
 
     fn push(&self, slot: Slot, limit: usize, position: Position) -> Result<(), SinkError> {
@@ -741,26 +863,9 @@ impl AttachmentSink {
         if queue.closed {
             return Err(SinkError::Unusable);
         }
-        let bytes = slot.bytes();
-        // One accounting site for both lanes: a second `push` beside this one
-        // is how a lane ends up bounded by the other lane's number.
-        let forward = matches!(slot, Slot::Forward(_));
-        let lane = if forward {
-            &mut queue.forward
-        } else {
-            &mut queue.stream
-        };
-        if lane.charged().saturating_add(bytes) > limit {
-            return Err(SinkError::Full);
-        }
-        lane.queued += bytes;
-        if forward {
-            queue.forward_entries += 1;
-        }
-        match position {
-            Position::Back => queue.order.push_back(slot),
-            Position::Front => queue.order.push_front(slot),
-        }
+        queue
+            .admit(slot, limit, position)
+            .map_err(|_| SinkError::Full)?;
         shared.publish(&queue);
         shared.ready.notify_one();
         Ok(())
@@ -792,6 +897,18 @@ impl AttachmentSink {
             return;
         };
         spare.append(&mut queue.spare);
+    }
+
+    /// The same for the screen pieces the frame pool will not hold. Kept apart
+    /// because they are two orders of magnitude larger: [`SPARE_SCREENS`] of
+    /// them on either side of the hand-off, not [`SPARE_FRAMES`].
+    pub fn reclaim_screens(&self, spare: &mut Vec<Vec<u8>>) {
+        let Ok(mut queue) = self.shared().queue.lock() else {
+            return;
+        };
+        for frame in queue.screens.drain(..) {
+            keep_screen(spare, frame);
+        }
     }
 
     pub fn close(&self) {
@@ -995,6 +1112,32 @@ mod tests {
         sink.close();
     }
 
+    /// Superseding is the dominant way a screen leaves the lane for exactly the
+    /// slow client the pool exists for, so the pieces it displaces are the ones
+    /// the next cut most needs back.
+    #[test]
+    fn a_superseded_screen_leaves_its_pieces_in_the_pool() {
+        let (sink, release, _log) = stalled();
+        sink.send_screen(Cut::raw(vec![vec![0xA0; 8]]))
+            .expect("first screen");
+        // Held inside the writer's `write`, so what follows is a queue rather
+        // than a race with the drain.
+        std::thread::sleep(Duration::from_millis(50));
+        sink.send_screen(Cut::raw(vec![vec![0xB0; 8], vec![0xB1; 8]]))
+            .expect("second screen");
+        sink.send_screen(Cut::raw(vec![vec![0xC0; 8], vec![0xC1; 8]]))
+            .expect("third screen");
+        let mut spare = Vec::new();
+        sink.reclaim(&mut spare);
+        assert_eq!(
+            spare.len(),
+            2,
+            "the superseded screen's pieces were freed rather than pooled"
+        );
+        let _ = release.send(());
+        sink.close();
+    }
+
     /// Reserved room was never priority: an `Exit` at the back of the order
     /// waits out every stream frame in front of it.
     #[test]
@@ -1111,6 +1254,28 @@ mod tests {
         // the discard exists to get the client out of.
         sink.send_output(vec![0; 16 * 1024])
             .expect("the discard returned the room the dropped output held");
+        let _ = release.send(());
+        sink.close();
+    }
+
+    /// A discard runs on the way into a sync episode, which is when the encoder
+    /// starts drawing hardest on this same pool.
+    #[test]
+    fn a_discard_leaves_the_stream_it_drops_in_the_pool() {
+        let (sink, release, _log) = stalled();
+        sink.send_output(vec![0; 8]).expect("first frame");
+        std::thread::sleep(Duration::from_millis(50));
+        for _ in 0..8 {
+            sink.send_output(vec![0xBB; 4096]).expect("stream frame");
+        }
+        sink.discard_stream();
+        let mut spare = Vec::new();
+        sink.reclaim(&mut spare);
+        assert_eq!(spare.len(), 8, "the discarded frames were freed");
+        assert!(
+            spare.iter().all(|frame| frame.capacity() >= 4096),
+            "a discarded frame comes back at the size it was cut to"
+        );
         let _ = release.send(());
         sink.close();
     }
@@ -1453,6 +1618,100 @@ mod tests {
             sink.shared().outstanding.load(Ordering::Relaxed),
             stalled + 1,
             "the byte stream itself must still be counted"
+        );
+        sink.close();
+    }
+
+    /// A `CommandAck` is one control frame per keystroke per attachment and a
+    /// `Ping` one per probe, beside a pool the transport has already given
+    /// sixty-four buffers back to.
+    #[test]
+    fn a_warm_sink_sends_control_frames_out_of_one_pooled_buffer() {
+        let (sink, release, log) = stalled();
+        // A spent buffer, still holding what it carried last: a control frame
+        // is twenty-odd bytes, so no probe here can grow it into a new one.
+        sink.shared()
+            .queue
+            .lock()
+            .expect("queue")
+            .spare
+            .push(vec![0xFF; 4096]);
+        let probe = ServerMessage::Ping {
+            token: 1,
+            echo_ack: None,
+            interval_ms: 250,
+        };
+        let frame = probe.encode(Version::LOCAL).expect("a probe encodes");
+
+        for round in 1..=4 {
+            sink.send(&probe).expect("a probe queues on reserved room");
+            assert!(
+                sink.shared().queue.lock().expect("queue").spare.is_empty(),
+                "round {round} allocated beside a pool that was holding a buffer"
+            );
+            let _ = release.send(());
+            wait_for(&log, frame.len() * round);
+            // The batch retires on the writer's way back for the next one.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let queue = sink.shared().queue.lock().expect("queue");
+                if let Some(spare) = queue.spare.first() {
+                    assert!(
+                        spare.capacity() >= 4096,
+                        "round {round} sent a buffer of its own and kept the pool's"
+                    );
+                    break;
+                }
+                drop(queue);
+                assert!(
+                    Instant::now() < deadline,
+                    "round {round} never gave its buffer back"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(
+            *log.lock().expect("sink log"),
+            frame.repeat(4),
+            "a reused buffer carried bytes that were not this frame's"
+        );
+        sink.close();
+    }
+
+    /// A stream framing cuts one screen into a single piece of up to a megabyte,
+    /// which the frame pool refuses for the reason it exists. Without a pool of
+    /// its own that is an allocation and a free per repaint, at up to sixty a
+    /// second for as long as a sync episode lasts.
+    #[test]
+    fn a_screen_piece_too_large_for_the_frame_pool_is_kept_in_its_own() {
+        let (sink, release, log) = stalled();
+        sink.send_screen(Cut::raw(vec![vec![0xEE; MAX_OUTPUT_CHUNK + 1]]))
+            .expect("a screen queues");
+        for _ in 0..4 {
+            let _ = release.send(());
+        }
+        wait_for(&log, MAX_OUTPUT_CHUNK + 1);
+
+        // The batch retires on the writer's way back for the next one.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut kept = Vec::new();
+        while kept.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the screen piece was freed rather than kept"
+            );
+            sink.reclaim_screens(&mut kept);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            kept[0].capacity() > MAX_OUTPUT_CHUNK,
+            "the buffer that came back is not the piece that went out"
+        );
+        let mut frames = Vec::new();
+        sink.reclaim(&mut frames);
+        assert!(
+            frames.is_empty(),
+            "a screen piece went into the sixty-four deep pool of small frames"
         );
         sink.close();
     }
