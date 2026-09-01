@@ -33,8 +33,14 @@ pub const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 /// as [`Cause::Overflowed`], not lost.
 pub(crate) const MAX_TRACKED: usize = 4096;
 
-/// Two, because one timeout is a burst.
-pub(crate) const PERSISTENT_SILENCE: u32 = 2;
+/// RFC 9002 §7.6.1's `kPersistentCongestionThreshold`. Counting probe timeouts
+/// instead measures this side's own impatience rather than the path: two
+/// expiries of a timer built from a 5 ms round trip is 100 ms, which a wireless
+/// link spends on link-layer retries without dropping a frame.
+const PERSISTENT_CONGESTION_THRESHOLD: u32 = 3;
+
+/// How long a minimum round trip stands before a fresh sample replaces it.
+const RTT_MIN_WINDOW: Duration = Duration::from_secs(10);
 
 /// RFC 9002 §6.2.1, bounded or an hour of backoff costs an hour of recovery.
 const MAX_PTO_BACKOFF: u32 = 6;
@@ -47,17 +53,26 @@ pub struct Rtt {
     /// The latest sample and the minimum with the peer's admitted delay taken off,
     /// which is what a trigger comparing one sample against another has to read.
     latest_adjusted: u64,
-    min_adjusted: Option<u64>,
+    /// Windowed rather than lifetime, and carrying the instant it was taken: a
+    /// path whose delay rises under it — a wireless link falling back to a lower
+    /// rate, a route change — is otherwise measured for ever against a floor it
+    /// can no longer reach, and every later sample reads as a filling queue.
+    min_adjusted: Option<(u64, Instant)>,
 }
 
 impl Rtt {
     /// `delay` is what the peer admits to holding it, and comes off the top.
-    pub fn sample(&mut self, taken: Duration, delay: Duration) {
+    pub fn sample(&mut self, taken: Duration, delay: Duration, now: Instant) {
         let taken = micros(taken);
         // Never to zero, or a peer claiming a negative trip pins the loss delay.
         let adjusted = taken.saturating_sub(micros(delay)).max(1);
         self.latest_adjusted = adjusted;
-        self.min_adjusted = Some(self.min_adjusted.map_or(adjusted, |min| min.min(adjusted)));
+        let replace = self.min_adjusted.is_none_or(|(min, since)| {
+            adjusted < min || now.saturating_duration_since(since) >= RTT_MIN_WINDOW
+        });
+        if replace {
+            self.min_adjusted = Some((adjusted, now));
+        }
         let Some(smoothed) = self.smoothed else {
             self.smoothed = Some(adjusted);
             self.var = adjusted / 2;
@@ -90,7 +105,7 @@ impl Rtt {
     /// The closest thing to the path's propagation delay with no queue in it.
     #[must_use]
     pub fn minimum_adjusted(&self) -> Option<Duration> {
-        self.min_adjusted.map(Duration::from_micros)
+        self.min_adjusted.map(|(min, _)| Duration::from_micros(min))
     }
 
     /// How long a packet may go unacknowledged, with later ones acknowledged.
@@ -118,6 +133,13 @@ impl Rtt {
     pub fn probe_timeout(&self) -> Duration {
         let smoothed = self.smoothed.unwrap_or(micros(INITIAL_RTT));
         Duration::from_micros(smoothed + (4 * self.var).max(TIMER_GRANULARITY)) + MAX_ACK_DELAY
+    }
+
+    /// RFC 9002 §7.6.1. Measured on the unbacked-off timer, since the backoff
+    /// is this side's response to the silence and not a fact about the path.
+    #[must_use]
+    pub fn persistent_congestion_period(&self) -> Duration {
+        self.probe_timeout() * PERSISTENT_CONGESTION_THRESHOLD
     }
 }
 
@@ -175,6 +197,14 @@ pub struct Gone {
     pub cause: Cause,
 }
 
+/// A packet given up on, kept only long enough for a late acknowledgement to
+/// prove it was not: the cause is what says whether anything moved in response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WrittenOff {
+    number: u64,
+    cause: Cause,
+}
+
 /// Names only packets this side has sealed: `largest` is a high-water mark
 /// never lowered, so one naming a packet nobody sealed writes off the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,9 +230,17 @@ pub struct LossDetector {
     arrived: Vec<Arrived>,
     gone: Vec<Gone>,
     /// So a late acknowledgement is counted as the mistake it proves.
-    written_off: VecDeque<u64>,
+    written_off: VecDeque<WrittenOff>,
     silence: u32,
+    /// The send time of the oldest packet in the current run of silence: RFC
+    /// 9002 §7.6.2 measures its period between what it gave up on, not between
+    /// expiries of a timer this side chose.
+    silent_since: Option<Instant>,
+    /// So one run of silence is one congestion event, however long it runs.
+    answered: bool,
     persistent: bool,
+    /// Whether the last acknowledgement named a packet already written off.
+    revived: bool,
     losses: u64,
     spurious: u64,
 }
@@ -229,7 +267,10 @@ impl LossDetector {
             gone: Vec::new(),
             written_off: VecDeque::new(),
             silence: 0,
+            silent_since: None,
+            answered: false,
             persistent: false,
+            revived: false,
             losses: 0,
             spurious: 0,
         }
@@ -263,6 +304,13 @@ impl LossDetector {
         self.persistent
     }
 
+    /// The peer named a packet this side had already given up on and answered
+    /// for, so the answer was a mistake and the caller may take it back.
+    #[must_use]
+    pub const fn revived(&self) -> bool {
+        self.revived
+    }
+
     /// Doubled per consecutive timeout, reset by anything the peer says.
     #[must_use]
     pub fn probe_timeout(&self) -> Duration {
@@ -281,6 +329,8 @@ impl LossDetector {
     pub fn migrated(&mut self) {
         self.rtt = Rtt::default();
         self.silence = 0;
+        self.silent_since = None;
+        self.answered = false;
         self.largest_acked = None;
         self.written_off.clear();
     }
@@ -324,6 +374,8 @@ impl LossDetector {
         let ack = &ack.0;
         self.clear();
         self.silence = 0;
+        self.silent_since = None;
+        self.answered = false;
         self.largest_acked = Some(
             self.largest_acked
                 .map_or(ack.largest, |seen| seen.max(ack.largest)),
@@ -360,7 +412,7 @@ impl LossDetector {
         self.arrived.reverse();
         self.count_spurious(ack);
         if let Some(taken) = sample {
-            self.rtt.sample(taken, ack.delay);
+            self.rtt.sample(taken, ack.delay, now);
         }
         self.detect(now);
         sample
@@ -403,6 +455,17 @@ impl LossDetector {
                 Cause::Lost
             } else if age >= probe_timeout {
                 abandoned = true;
+                let since = *self.silent_since.get_or_insert(oldest.sent);
+                // A run long enough to be the path being gone rather than slow,
+                // and only once: the rest of the run is the same event.
+                if !self.answered
+                    && self.rtt.smoothed().is_some()
+                    && oldest.sent.saturating_duration_since(since)
+                        >= self.rtt.persistent_congestion_period()
+                {
+                    self.persistent = true;
+                    self.answered = true;
+                }
                 Cause::Silent
             } else {
                 break;
@@ -412,7 +475,6 @@ impl LossDetector {
         }
         if abandoned {
             self.silence += 1;
-            self.persistent = self.silence == PERSISTENT_SILENCE;
         }
     }
 
@@ -420,7 +482,10 @@ impl LossDetector {
         if cause == Cause::Lost {
             self.losses += 1;
         }
-        self.written_off.push_back(packet.number);
+        self.written_off.push_back(WrittenOff {
+            number: packet.number,
+            cause,
+        });
         while self.written_off.len() > 64 {
             self.written_off.pop_front();
         }
@@ -437,15 +502,17 @@ impl LossDetector {
         while self
             .written_off
             .front()
-            .is_some_and(|&number| number < floor)
+            .is_some_and(|written| written.number < floor)
         {
             self.written_off.pop_front();
         }
         let mut index = 0;
         while index < self.written_off.len() {
-            if covers(ack, self.written_off[index]) {
-                self.written_off.remove(index);
+            if covers(ack, self.written_off[index].number) {
+                let written = self.written_off.remove(index).expect("index is in range");
                 self.spurious += 1;
+                // Overflow moved no window, so there is nothing to take back.
+                self.revived |= written.cause != Cause::Overflowed;
             } else {
                 index += 1;
             }
@@ -456,6 +523,7 @@ impl LossDetector {
         self.arrived.clear();
         self.gone.clear();
         self.persistent = false;
+        self.revived = false;
     }
 }
 
@@ -525,7 +593,11 @@ mod tests {
     #[test]
     fn an_acknowledgement_delay_longer_than_the_trip_does_not_produce_nothing() {
         let mut rtt = Rtt::default();
-        rtt.sample(Duration::from_millis(10), Duration::from_secs(9));
+        rtt.sample(
+            Duration::from_millis(10),
+            Duration::from_secs(9),
+            Instant::now(),
+        );
         assert_eq!(rtt.smoothed(), Some(Duration::from_micros(1)));
     }
 
@@ -683,34 +755,104 @@ mod tests {
         assert_eq!(detector.silence(), 0);
     }
 
-    /// Else the window pins at its floor on a path that loses acks, not data.
+    /// Else a wireless link spending a tenth of a second on link-layer retries —
+    /// dropping nothing — is answered as a path that went away.
     #[test]
-    fn persistent_congestion_is_declared_once_per_run_of_silence() {
-        let mut detector = LossDetector::new();
-        let mut now = Instant::now();
-        detector.sealed(flight(0, now));
-        now += detector.probe_timeout();
-        detector.expire(now);
-        assert!(!detector.persistent_congestion(), "one timeout is a burst");
+    fn persistent_congestion_is_a_run_of_silence_the_path_cannot_explain() {
+        let start = Instant::now();
+        // A run is measured against the path, so the path has to be measured.
+        let sampled = |detector: &mut LossDetector| {
+            detector.sealed(flight(0, start));
+            detector.acknowledged(ack(0, 0), start + Duration::from_millis(5));
+        };
 
-        detector.sealed(flight(1, now));
-        now += detector.probe_timeout();
-        detector.expire(now);
+        let mut detector = LossDetector::new();
+        sampled(&mut detector);
+        let period = detector.rtt().persistent_congestion_period();
+
+        // Two packets whose send times sit inside one period: a burst.
+        detector.sealed(flight(1, start));
+        detector.sealed(flight(2, start + period / 2));
+        detector.expire(start + period * 4);
+        assert_eq!(detector.gone().len(), 2);
+        assert!(detector.gone().iter().all(|g| g.cause == Cause::Silent));
+        assert!(
+            !detector.persistent_congestion(),
+            "a burst is not a path going away"
+        );
+
+        // Two spanning one: it is.
+        let mut detector = LossDetector::new();
+        sampled(&mut detector);
+        detector.sealed(flight(1, start));
+        detector.sealed(flight(2, start + period));
+        detector.expire(start + period * 4);
         assert!(detector.persistent_congestion());
 
-        detector.sealed(flight(2, now));
-        now += detector.probe_timeout();
-        detector.expire(now);
+        // One run is one event, however many packets it goes on to retire.
+        detector.sealed(flight(3, start + period * 2));
+        detector.expire(start + period * 5);
         assert!(!detector.persistent_congestion(), "already answered");
 
-        detector.sealed(flight(3, now));
-        detector.acknowledged(ack(3, 0), now);
-        for number in 4..6 {
-            detector.sealed(flight(number, now));
-            now += detector.probe_timeout();
-            detector.expire(now);
-        }
+        // An acknowledgement ends the run, and the next one is a fresh event.
+        let resumed = start + period * 5;
+        detector.sealed(flight(4, resumed));
+        detector.acknowledged(ack(4, 0), resumed + Duration::from_millis(5));
+        detector.sealed(flight(5, resumed));
+        detector.sealed(flight(6, resumed + period * 2));
+        detector.expire(resumed + period * 6);
         assert!(detector.persistent_congestion(), "a fresh event");
+    }
+
+    /// A lifetime minimum is a claim about a path that no longer exists. Once
+    /// the link rate drops beneath it every later sample reads as a queue that
+    /// was never there, and the delay trigger ends slow start for good.
+    #[test]
+    fn the_minimum_round_trip_ages_out_when_the_path_gets_slower() {
+        let mut rtt = Rtt::default();
+        let start = Instant::now();
+        rtt.sample(Duration::from_millis(2), Duration::ZERO, start);
+        assert_eq!(rtt.minimum_adjusted(), Some(Duration::from_millis(2)));
+
+        // Inside the window the measured floor stands.
+        rtt.sample(
+            Duration::from_millis(40),
+            Duration::ZERO,
+            start + RTT_MIN_WINDOW / 2,
+        );
+        assert_eq!(rtt.minimum_adjusted(), Some(Duration::from_millis(2)));
+
+        // Past it the path is measured again rather than held to one it left.
+        let outside = start + RTT_MIN_WINDOW + Duration::from_millis(1);
+        rtt.sample(Duration::from_millis(40), Duration::ZERO, outside);
+        assert_eq!(rtt.minimum_adjusted(), Some(Duration::from_millis(40)));
+
+        // And anything quicker still takes it at once.
+        rtt.sample(Duration::from_millis(3), Duration::ZERO, outside);
+        assert_eq!(rtt.minimum_adjusted(), Some(Duration::from_millis(3)));
+    }
+
+    /// Counting them is half the answer: the controller has to be told, or it
+    /// keeps a window it gave up for a packet that arrived after all.
+    #[test]
+    fn a_late_acknowledgement_reports_the_write_off_as_revived() {
+        let mut detector = LossDetector::new();
+        let now = Instant::now();
+        for number in 0..5 {
+            detector.sealed(flight(number, now));
+        }
+        detector.acknowledged(ack(4, 0b0111), now);
+        assert_eq!(detector.gone().len(), 1, "number zero");
+        assert!(!detector.revived(), "nothing has come back yet");
+
+        detector.sealed(flight(5, now));
+        detector.acknowledged(ack(5, 0b11111), now + Duration::from_millis(1));
+        assert_eq!(detector.spurious(), 1);
+        assert!(detector.revived(), "so the window response was a mistake");
+
+        // Cleared by the next event: one arrival is one refund.
+        detector.sealed(flight(6, now));
+        assert!(!detector.revived());
     }
 
     /// The byte ceiling admits twenty thousand keystroke-sized datagrams.

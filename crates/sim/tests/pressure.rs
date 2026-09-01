@@ -445,3 +445,56 @@ fn a_bulk_sender_losing_full_size_packets_to_a_full_queue_keeps_its_path() {
         "the farewell never arrived"
     );
 }
+
+/// A wireless link at a low modulation rate: a run of link-layer retries holds
+/// a datagram well past the sender's probe timeout, and drops nothing at all.
+struct Retries {
+    rng: Rng,
+    hold: Duration,
+}
+
+impl Schedule for Retries {
+    fn next(&mut self, _from: Side, _datagram: &[u8]) -> Fault {
+        if self.rng.next_u64().is_multiple_of(12) {
+            Fault::Delay(self.hold)
+        } else {
+            Fault::Deliver
+        }
+    }
+}
+
+/// The regime a wireless link falls into once its signal drops: a tenth of a
+/// second of retries, not one frame lost. Counted as loss it is persistent
+/// congestion every few seconds, and a repaint then crawls out from two
+/// datagrams while the path itself is idle — which is the whole of the fault.
+#[test]
+fn a_link_that_retries_rather_than_drops_keeps_its_window() {
+    let mut clean = Sim::new(Perfect);
+    clean.link.latency = Duration::from_millis(5);
+    pour(&mut clean, Side::Server, 0..400, 1_000);
+    let clean_stats = clean.stats(Side::Server);
+
+    let mut sim = Sim::new(Retries {
+        rng: Rng::seeded(7),
+        hold: Duration::from_millis(120),
+    });
+    sim.link.latency = Duration::from_millis(5);
+    pour(&mut sim, Side::Server, 0..400, 1_000);
+
+    sim.assert_sound();
+    assert_eq!(sim.delivered(Side::Client).len(), 400);
+    let stats = sim.stats(Side::Server);
+    assert!(
+        stats.spurious > 0,
+        "nothing arrived after being given up on, so this proves nothing: {stats:?}"
+    );
+    assert_eq!(
+        stats.plpmtu, clean_stats.plpmtu,
+        "lateness read as loss narrowed a path that dropped nothing: {stats:?}"
+    );
+    assert!(
+        stats.cwnd * 10 > clean_stats.cwnd,
+        "the window never recovered from losses that were only lateness: \
+         {stats:?} against {clean_stats:?}"
+    );
+}

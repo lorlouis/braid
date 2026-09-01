@@ -430,6 +430,11 @@ impl Endpoint {
     /// In one place because the window, the MTU search and the
     /// persistent-congestion rule all read it, and two copies would disagree.
     fn absorb(&mut self, now: Instant) {
+        // Before the losses below, which would overwrite the snapshot it hands
+        // back: a revived write-off answers the episode before this one.
+        if self.loss.revived() {
+            self.congestion.spurious();
+        }
         for arrived in self.loss.arrived() {
             self.congestion.acknowledged(
                 arrived.bytes,
