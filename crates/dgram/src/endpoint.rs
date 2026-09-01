@@ -430,9 +430,8 @@ impl Endpoint {
     /// In one place because the window, the MTU search and the
     /// persistent-congestion rule all read it, and two copies would disagree.
     fn absorb(&mut self, now: Instant) {
-        // First: a write-off the peer has just revived belongs to the episode
-        // *before* whatever this acknowledgement goes on to declare, and a loss
-        // recorded below would otherwise overwrite the window it refunds.
+        // Before the losses below, which would overwrite the snapshot it hands
+        // back: a revived write-off answers the episode before this one.
         if self.loss.revived() {
             self.congestion.spurious();
         }

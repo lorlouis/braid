@@ -67,14 +67,12 @@ impl Rtt {
         // Never to zero, or a peer claiming a negative trip pins the loss delay.
         let adjusted = taken.saturating_sub(micros(delay)).max(1);
         self.latest_adjusted = adjusted;
-        self.min_adjusted = Some(match self.min_adjusted {
-            Some((min, since))
-                if adjusted >= min && now.saturating_duration_since(since) < RTT_MIN_WINDOW =>
-            {
-                (min, since)
-            }
-            _ => (adjusted, now),
+        let replace = self.min_adjusted.is_none_or(|(min, since)| {
+            adjusted < min || now.saturating_duration_since(since) >= RTT_MIN_WINDOW
         });
+        if replace {
+            self.min_adjusted = Some((adjusted, now));
+        }
         let Some(smoothed) = self.smoothed else {
             self.smoothed = Some(adjusted);
             self.var = adjusted / 2;

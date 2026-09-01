@@ -293,13 +293,10 @@ impl Congestion {
         self.overshoot = 0;
     }
 
-    /// Overwrites, and is reached only where a *new* episode begins: the rest
-    /// of a flight lost together returns above without disturbing it. Holding
-    /// it no longer than one episode is what bounds how stale a refund can be,
-    /// and the register of write-offs the peer can still revive is bounded to
-    /// match. Clearing it when recovery ends instead would discard it about one
-    /// round trip in — always before the late acknowledgement that disproves
-    /// the loss, which is the only thing it exists for.
+    /// Overwrites, and is reached only where a new episode begins: a flight
+    /// lost together returns above. Held to the next episode rather than
+    /// cleared when recovery ends, which discards it about a round trip in —
+    /// before the late acknowledgement it exists to answer.
     fn remember(&mut self) {
         self.undo = Some(Undo {
             window: self.window,
@@ -313,8 +310,7 @@ impl Congestion {
         let Some(undo) = self.undo.take() else {
             return;
         };
-        let ceiling = self.ceiling();
-        self.window = self.window.max(undo.window).min(ceiling);
+        self.window = self.window.max(undo.window).min(self.ceiling());
         self.ssthresh = self.ssthresh.max(undo.ssthresh);
         self.recovery_start = None;
         self.credit = 0;
@@ -329,9 +325,8 @@ impl Congestion {
 
     /// RFC 9002 §7.6.2's persistent congestion, answered the way TCP answers a
     /// retransmission timeout: the window restarts at the floor and slow start
-    /// carries it back. Leaving `ssthresh` where a run of halvings and the delay
-    /// trigger had driven it is what strands a connection in congestion
-    /// avoidance one datagram per round trip above two.
+    /// carries it back. Left where halvings and the delay trigger drive it,
+    /// `ssthresh` strands the connection one datagram per round trip above two.
     pub fn collapse(&mut self, now: Instant) {
         self.remember();
         self.ssthresh = (self.window / 2).max(self.initial());
@@ -343,10 +338,11 @@ impl Congestion {
 
     /// RFC 9002 §5.5: a 5 ms minimum makes every 100 ms sample an overshoot.
     pub fn migrated(&mut self) {
-        self.window = self.datagram * INITIAL_DATAGRAMS;
+        self.window = self.initial();
         self.ssthresh = usize::MAX;
         self.credit = 0;
         self.recovery_start = None;
+        self.undo = None;
         self.overshoot = 0;
         self.srtt = None;
         self.pacer = Pacer::new();
