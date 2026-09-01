@@ -34,8 +34,12 @@ const INITIAL_PACE: Duration = Duration::from_millis(100);
 /// Three, from RFC 9406, because one is jitter.
 const OVERSHOOT_SAMPLES: u32 = 3;
 
-/// Slow start ends when the round trip rises by this much over its minimum.
+/// RFC 9406's `MIN_RTT_THRESH` and `MAX_RTT_THRESH`: slow start ends when the
+/// round trip rises this far over its minimum. Clamped at both ends, or a path
+/// measured in microseconds fires on scheduler noise and one measured in
+/// hundreds of milliseconds never fires at all.
 const OVERSHOOT_FLOOR: Duration = Duration::from_millis(4);
+const OVERSHOOT_CEILING: Duration = Duration::from_millis(16);
 
 /// A token bucket, refilled at the window's own rate.
 /// [`available`](Pacer::available) is clock-pure, so "may I send" needs no
@@ -114,6 +118,16 @@ impl Pacer {
     }
 }
 
+/// The window as it stood before a congestion episode. A path that retries
+/// beneath the transport answers a "loss" with a late acknowledgement rather
+/// than a gap, and the response to it has to be given back or the window spends
+/// its life recovering from events that never happened.
+#[derive(Clone, Copy)]
+struct Undo {
+    window: usize,
+    ssthresh: usize,
+}
+
 pub struct Congestion {
     window: usize,
     ssthresh: usize,
@@ -123,6 +137,8 @@ pub struct Congestion {
     credit: usize,
     /// The rest of the flight in the air with a loss must not halve it again.
     recovery_start: Option<Instant>,
+    /// Set by the first signal of an episode, taken by the proof it was wrong.
+    undo: Option<Undo>,
     datagram: usize,
     /// Consecutive round-trip samples above the trigger, which ends slow start.
     overshoot: u32,
@@ -139,6 +155,7 @@ impl Congestion {
             in_flight: 0,
             credit: 0,
             recovery_start: None,
+            undo: None,
             datagram,
             overshoot: 0,
             pacer: Pacer::new(),
@@ -174,6 +191,12 @@ impl Congestion {
 
     const fn ceiling(&self) -> usize {
         self.datagram * MAX_DATAGRAMS
+    }
+
+    /// What RFC 9002 §7.2 lets any connection open with, and so the least a
+    /// measurement can honestly say a path carries.
+    const fn initial(&self) -> usize {
+        self.datagram * INITIAL_DATAGRAMS
     }
 
     const fn burst(&self) -> usize {
@@ -262,9 +285,38 @@ impl Congestion {
         if self.recovery_start.is_some_and(|start| sent < start) {
             return;
         }
+        self.remember();
         self.recovery_start = Some(now);
         self.window = (self.window / 2).max(self.minimum());
         self.ssthresh = self.window;
+        self.credit = 0;
+        self.overshoot = 0;
+    }
+
+    /// Overwrites, and is reached only where a *new* episode begins: the rest
+    /// of a flight lost together returns above without disturbing it. Holding
+    /// it no longer than one episode is what bounds how stale a refund can be,
+    /// and the register of write-offs the peer can still revive is bounded to
+    /// match. Clearing it when recovery ends instead would discard it about one
+    /// round trip in — always before the late acknowledgement that disproves
+    /// the loss, which is the only thing it exists for.
+    fn remember(&mut self) {
+        self.undo = Some(Undo {
+            window: self.window,
+            ssthresh: self.ssthresh,
+        });
+    }
+
+    /// The peer acknowledged a packet this side had already answered for, so
+    /// the answer was a mistake and the window it cost comes back.
+    pub fn spurious(&mut self) {
+        let Some(undo) = self.undo.take() else {
+            return;
+        };
+        let ceiling = self.ceiling();
+        self.window = self.window.max(undo.window).min(ceiling);
+        self.ssthresh = self.ssthresh.max(undo.ssthresh);
+        self.recovery_start = None;
         self.credit = 0;
         self.overshoot = 0;
     }
@@ -275,8 +327,14 @@ impl Congestion {
         self.in_flight = self.in_flight.saturating_sub(bytes);
     }
 
-    /// RFC 9002 persistent congestion, answered by starting again as if new.
+    /// RFC 9002 §7.6.2's persistent congestion, answered the way TCP answers a
+    /// retransmission timeout: the window restarts at the floor and slow start
+    /// carries it back. Leaving `ssthresh` where a run of halvings and the delay
+    /// trigger had driven it is what strands a connection in congestion
+    /// avoidance one datagram per round trip above two.
     pub fn collapse(&mut self, now: Instant) {
+        self.remember();
+        self.ssthresh = (self.window / 2).max(self.initial());
         self.window = self.minimum();
         self.credit = 0;
         self.recovery_start = Some(now);
@@ -303,14 +361,17 @@ impl Congestion {
         let Some(minimum) = rtt.minimum_adjusted() else {
             return;
         };
-        let trigger = minimum + (minimum / 8).max(OVERSHOOT_FLOOR);
+        let trigger = minimum + (minimum / 8).clamp(OVERSHOOT_FLOOR, OVERSHOOT_CEILING);
         if rtt.latest_adjusted() <= trigger {
             self.overshoot = 0;
             return;
         }
         self.overshoot += 1;
         if self.overshoot >= OVERSHOOT_SAMPLES {
-            self.ssthresh = self.window;
+            // Never below the initial window: a delay reading is evidence that
+            // this window is too big, never that the path carries less than
+            // every new connection already assumes it does.
+            self.ssthresh = self.window.max(self.initial());
         }
     }
 }
@@ -328,7 +389,11 @@ mod tests {
 
     fn rtt(millis: u64) -> Rtt {
         let mut rtt = Rtt::default();
-        rtt.sample(Duration::from_millis(millis), Duration::ZERO);
+        rtt.sample(
+            Duration::from_millis(millis),
+            Duration::ZERO,
+            Instant::now(),
+        );
         rtt
     }
 
@@ -434,12 +499,12 @@ mod tests {
         congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         let doubling = congestion.window();
         for _ in 0..OVERSHOOT_SAMPLES {
-            rtt.sample(Duration::from_millis(300), Duration::ZERO);
+            rtt.sample(Duration::from_millis(300), Duration::ZERO, now);
             congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         }
         let stopped = congestion.window();
         for _ in 0..20 {
-            rtt.sample(Duration::from_millis(300), Duration::ZERO);
+            rtt.sample(Duration::from_millis(300), Duration::ZERO, now);
             congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         }
         assert!(doubling < stopped);
@@ -533,11 +598,11 @@ mod tests {
 
         let mut congestion = Congestion::new(MSS);
         let mut rtt = Rtt::default();
-        rtt.sample(path, Duration::ZERO);
+        rtt.sample(path, Duration::ZERO, now);
         congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         let opened = congestion.window();
         for _ in 0..samples {
-            rtt.sample(path + held, held);
+            rtt.sample(path + held, held, now);
             congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         }
         assert_eq!(
@@ -549,15 +614,87 @@ mod tests {
         // The same spread, with the peer admitting to none of it.
         let mut congestion = Congestion::new(MSS);
         let mut rtt = Rtt::default();
-        rtt.sample(path, Duration::ZERO);
+        rtt.sample(path, Duration::ZERO, now);
         congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         for _ in 0..samples {
-            rtt.sample(path + held, Duration::ZERO);
+            rtt.sample(path + held, Duration::ZERO, now);
             congestion.acknowledged(MSS, now, &rtt, Limited::Window);
         }
         assert!(
             congestion.window() < opened + samples * MSS,
             "an unexplained climb is still the bottleneck buffer filling"
+        );
+    }
+
+    /// Left in congestion avoidance at the floor, a window climbs one datagram
+    /// per round trip — and a path collapsing every few seconds never arrives.
+    #[test]
+    fn persistent_congestion_leaves_the_window_able_to_slow_start_again() {
+        let mut congestion = Congestion::new(MSS);
+        let now = Instant::now();
+        let rtt = rtt(20);
+        // A run of losses drives `ssthresh` down to the floor beside the window.
+        for _ in 0..20 {
+            let _ = congestion.sealed(MSS, now);
+            congestion.lost(MSS, now, now);
+        }
+        assert_eq!(congestion.window(), 2 * MSS);
+        congestion.collapse(now);
+        assert_eq!(congestion.window(), 2 * MSS, "the floor is still the floor");
+
+        let opened = congestion.window();
+        let later = now + Duration::from_millis(1);
+        for _ in 0..4 {
+            congestion.acknowledged(MSS, later, &rtt, Limited::Window);
+        }
+        assert_eq!(
+            congestion.window(),
+            opened + 4 * MSS,
+            "slow start carries it back, not one datagram a round trip"
+        );
+    }
+
+    /// A link that retries beneath the transport answers a "loss" with a late
+    /// acknowledgement rather than a gap, and the halving cost nothing but rate.
+    #[test]
+    fn a_loss_the_peer_later_acknowledges_gives_the_window_back() {
+        let mut congestion = Congestion::new(MSS);
+        let now = Instant::now();
+        let rtt = rtt(20);
+        for _ in 0..20 {
+            congestion.acknowledged(MSS, now, &rtt, Limited::Window);
+        }
+        let before = congestion.window();
+        let _ = congestion.sealed(MSS, now);
+        congestion.lost(MSS, now, now);
+        assert!(congestion.window() < before, "halved on the evidence");
+        congestion.spurious();
+        assert_eq!(congestion.window(), before, "and the evidence was wrong");
+        congestion.spurious();
+        assert_eq!(congestion.window(), before, "one mistake, one refund");
+    }
+
+    /// Pinned there, the connection cannot slow start out of its own floor.
+    #[test]
+    fn the_delay_trigger_does_not_pin_the_window_below_what_a_new_one_opens_at() {
+        let mut congestion = Congestion::new(MSS);
+        let now = Instant::now();
+        let later = now + Duration::from_millis(1);
+        let mut rtt = rtt(5);
+        congestion.collapse(now);
+        assert_eq!(congestion.window(), 2 * MSS);
+        for _ in 0..OVERSHOOT_SAMPLES {
+            rtt.sample(Duration::from_millis(80), Duration::ZERO, now);
+            congestion.acknowledged(MSS, later, &rtt, Limited::Window);
+        }
+        let window = congestion.window();
+        for _ in 0..4 {
+            congestion.acknowledged(MSS, later, &rtt, Limited::Window);
+        }
+        assert_eq!(
+            congestion.window(),
+            window + 4 * MSS,
+            "jitter does not end slow start below the initial window"
         );
     }
 }
