@@ -253,6 +253,10 @@ pub enum ServerError {
     Setup(String),
     #[error("worker thread failed")]
     Worker,
+    /// A daemon that could not be asked holds an unknown number of sessions,
+    /// and an empty list would tell a user their shells are gone.
+    #[error("could not ask this user's daemon: {0}")]
+    DaemonSilent(String),
 }
 
 #[derive(Default)]

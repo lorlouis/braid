@@ -44,14 +44,14 @@ results.append(check("reattach: no extra shell spawned", shells() == 1))
 # --- 3. a second client joins rather than evicting ---
 #
 # A session is shared, so both clients drive the same shell and both see what
-# it prints.
+# it prints. `Detached` reaches the first client only when one of *its own*
+# resumes displaced an attachment, so a second client arriving must leave it
+# with nothing to report at all.
 c = Session()
 c.send(b"touch %s_SECOND\n" % MARK.encode())
 results.append(check("share: the joining client drives the shell", mark_appears("SECOND")))
 results.append(check("share: the first client was not displaced", b.proc.poll() is None))
-results.append(
-    check("share: no eviction notice", b"another client took over" not in b.buf)
-)
+results.append(check("share: no detach notice", b"[brd] detached" not in b.buf))
 
 # One shell, two views of it: what either client types the other must see,
 # because the bytes come from the one PTY they share.

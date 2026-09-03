@@ -326,31 +326,53 @@ pub(crate) fn datagrams_wanted() -> bool {
     std::env::var_os("BRD_NO_DATAGRAM").is_none()
 }
 
-/// Take the daemon up on its offer, or leave the session where it is. The
-/// `Resume` carries `*CLIENT_ID`, which makes the daemon *replace* the
-/// attachment `ssh` holds rather than open a second one. A failure costs the
-/// probes and nothing else, and prints nothing.
+/// What taking up a datagram offer cost.
+///
+/// The `Resume` carrying `*CLIENT_ID` is destructive on arrival: the daemon
+/// *replaces* the attachment `ssh` holds rather than opening a second one. So
+/// once one has left this process, `ssh` is no longer a fallback — the daemon
+/// may already have dropped that attachment, and only the answer this client
+/// never received would have said so.
+pub(crate) enum Offer {
+    Taken(DatagramSink, DatagramReader, Version),
+    /// No resume left this process, so the `ssh` attachment is untouched.
+    Untouched,
+    /// A resume went out and nothing answered it. Whether it arrived is
+    /// exactly what is unknown: the `ssh` attachment is either untouched or
+    /// already replaced by one this client cannot read, and that link is what
+    /// settles which — a `Detached` says the resume landed, and frames that
+    /// keep coming say it did not.
+    Spent,
+}
+
+/// Take the daemon up on its offer, or leave the session where it is. Prints
+/// nothing: the caller decides what a spent offer is worth.
 pub(crate) fn take_offer(
     offer: &DatagramOffer,
     state: &ReconnectState,
     deadline: &Deadline,
-) -> Option<(DatagramSink, DatagramReader, Version)> {
-    let link = DatagramLink::open(offer)?;
-    let (sink, mut reader) = link.split(deadline.clone())?;
+) -> Offer {
+    let Some(link) = DatagramLink::open(offer) else {
+        return Offer::Untouched;
+    };
+    let Some((sink, mut reader)) = link.split(deadline.clone()) else {
+        return Offer::Untouched;
+    };
     // A handshake frame: the datagram link negotiates its own version.
-    let resume = state
-        .resume_message(CmdSeq::first())
-        .encode(Version::LOCAL)
-        .ok()?;
+    let Ok(resume) = state.resume_message(CmdSeq::first()).encode(Version::LOCAL) else {
+        return Offer::Untouched;
+    };
     // The session's own deadline, borrowed: this runs before the loop that
     // reads against it, so nothing else is waiting on the number meanwhile.
     deadline.set(DATAGRAM_PROBE_INTERVAL);
     let mut payload = Vec::new();
     let mut answered = None;
+    let mut spent = false;
     for _ in 0..DATAGRAM_PROBES {
         if !sink.send(resume.clone()) {
             break;
         }
+        spent = true;
         let Ok(frame) = reader.read_frame(&mut payload, &mut || {}) else {
             continue;
         };
@@ -365,5 +387,9 @@ pub(crate) fn take_offer(
         break;
     }
     deadline.set(LINK_TIMEOUT);
-    answered.map(|version| (sink, reader, version))
+    match (answered, spent) {
+        (Some(version), _) => Offer::Taken(sink, reader, version),
+        (None, true) => Offer::Spent,
+        (None, false) => Offer::Untouched,
+    }
 }

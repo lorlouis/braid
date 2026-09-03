@@ -25,8 +25,9 @@ use braid_proto::{
 };
 use forward::{ForwardSpec, Forwards, Listeners};
 use inbound::{
-    CONSUMED_STRIDE, Deadline, DeadlineReader, Inbound, LINK_TIMEOUT, RESUME_TIMEOUT, Reorder,
-    datagrams_wanted, next_frame, place_output, reorder_deadline, silence_deadline, take_offer,
+    CONSUMED_STRIDE, Deadline, DeadlineReader, Inbound, LINK_TIMEOUT, Offer, RESUME_TIMEOUT,
+    Reorder, datagrams_wanted, next_frame, place_output, reorder_deadline, silence_deadline,
+    take_offer,
 };
 use log::log;
 use outbound::{Accepted, Checkpoint, ClientWriter, FrameSink, Link};
@@ -510,22 +511,38 @@ fn take_session(
         .map(|index| sessions.remove(index)))
 }
 
-/// A refusal is not an error and is never retried for this attachment. The caller drops its
-/// `SshTransport` on `Some`: the resume carries the same `ClientId`, so the daemon has
-/// already replaced the attachment.
+/// What one attachment's datagram upgrade did to the link the caller is holding.
+enum Upgraded {
+    /// The caller drops its `SshTransport`: the resume carries the same
+    /// `ClientId`, so the daemon has already replaced that attachment.
+    Migrated(Inbound, Version),
+    /// `ssh` is still this session's link. A resume may nonetheless have left
+    /// this process unanswered, in which case that link is also what says so:
+    /// the daemon it reached has already sent a `Detached` down it.
+    Stayed,
+}
+
+/// A refusal is not an error and is never retried for this attachment.
 fn upgrade(
     offer: Option<DatagramOffer>,
     state: &ReconnectState,
     deadline: &Deadline,
     input: &Arc<ClientWriter<Link>>,
-) -> Result<Option<(Inbound, Version)>, ClientError> {
+) -> Result<Upgraded, ClientError> {
     let Some(offer) = offer.filter(|_| datagrams_wanted()) else {
         log!("transport: staying on ssh, no datagram offer this attachment can take");
-        return Ok(None);
+        return Ok(Upgraded::Stayed);
     };
-    let Some((sink, reader, version)) = take_offer(&offer, state, deadline) else {
-        log!("transport: datagram offer declined, falling back to ssh");
-        return Ok(None);
+    let (sink, reader, version) = match take_offer(&offer, state, deadline) {
+        Offer::Taken(sink, reader, version) => (sink, reader, version),
+        Offer::Untouched => {
+            log!("transport: datagram offer declined, falling back to ssh");
+            return Ok(Upgraded::Stayed);
+        }
+        Offer::Spent => {
+            log!("transport: datagram resume unanswered; this attachment is in doubt");
+            return Ok(Upgraded::Stayed);
+        }
     };
     input.reconnect(Link::Datagram(sink), version)?;
     let resending = Arc::clone(input);
@@ -547,7 +564,7 @@ fn upgrade(
         }))
         .map_err(|_| io::Error::other("resend thread failed"))?;
     log!("transport: migrated to datagrams, epoch {epoch}");
-    Ok(Some((Inbound::Datagram(reader), version)))
+    Ok(Upgraded::Migrated(Inbound::Datagram(reader), version))
 }
 
 /// Say once, after the terminal is back, how much output this session never handed over.
@@ -622,11 +639,22 @@ pub fn run(
     } else {
         Some(Forwards::start(listeners, &input)?)
     };
+    // Cleared only by a `Detached` naming one of this client's own resumes:
+    // that frame is proof the resume landed and that nothing came back down
+    // the datagram path, so a second offer would cost the attachment this
+    // one's recovery is about to take. An unanswered resume alone proves
+    // nothing — if it never arrived, the `ssh` attachment was never touched
+    // and the next one's offer is worth exactly as much as this one's.
+    let mut offers_wanted = true;
+    let mut relink = false;
     // Before the session loop, so a migrating client never reconciles two transports.
-    if let Some((datagrams, spoken)) = upgrade(handshake.offer, &state, &deadline, &input)? {
-        inbound = datagrams;
-        version = spoken;
-        transport = None;
+    match upgrade(handshake.offer, &state, &deadline, &input)? {
+        Upgraded::Migrated(datagrams, spoken) => {
+            inbound = datagrams;
+            version = spoken;
+            transport = None;
+        }
+        Upgraded::Stayed => {}
     }
     // A whole frame: the default eight kibibytes would cut every full-size `Output` in eight.
     let display = Arc::new(Shared::new(Display::new(
@@ -743,6 +771,74 @@ pub fn run(
     // this thread is in raw mode and owns no row it could print a notice on.
     let mut skipped = 0_u64;
     loop {
+        // One re-establishment path, however the link was lost: a read that
+        // failed, or an attachment this client learned was already replaced.
+        if std::mem::take(&mut relink) {
+            input.disconnect()?;
+            display.lock()?.invalidate();
+            drop(transport.take());
+            let resumed = match reconnect(
+                destination,
+                &Reopen::Session(&state),
+                &input,
+                &StatusLine(&display),
+            ) {
+                Ok(Reconnected::Link(resumed)) => resumed,
+                Ok(Reconnected::Closed) => {
+                    checkpoint.force(&state);
+                    display.lock()?.teardown()?;
+                    drop(raw);
+                    eprintln!("[brd] detached; reattach with: brd {destination}");
+                    return Ok(());
+                }
+                // Terminal here, unlike the forward-only client: a fresh session in
+                // place of this user's shell is an empty screen where their work was.
+                Ok(Reconnected::Gone) => {
+                    let _ = display.lock().map(|mut display| display.teardown());
+                    drop(raw);
+                    return Err(ClientError::Remote(RejectReason::UnknownSession));
+                }
+                // The indicator owns the bottom row of a raw-mode screen.
+                Err(error) => {
+                    let _ = display.lock().map(|mut display| display.teardown());
+                    drop(raw);
+                    return Err(error);
+                }
+            };
+            transport = Some(resumed.transport);
+            // A replacement transport has measured nothing yet.
+            deadline.set(LINK_TIMEOUT);
+            inbound = Inbound::ssh(resumed.output, deadline.clone())?;
+            version = resumed.version;
+            input.reconnect(Link::Ssh(Outbox::new(resumed.input)), resumed.version)?;
+            // Before the repaint, so the screen is owed on the attachment that survives.
+            let offer = resumed.offer.filter(|_| offers_wanted);
+            match upgrade(offer, &state, &deadline, &input)? {
+                Upgraded::Migrated(datagrams, spoken) => {
+                    inbound = datagrams;
+                    version = spoken;
+                    transport = None;
+                }
+                Upgraded::Stayed => {}
+            }
+            // Every forward held bytes against a sink that refused them, and the pump
+            // thread cannot see this event for itself.
+            if let Some(forwards) = forwards.as_ref() {
+                forwards.link_restored();
+            }
+            // Chunks held against the old stream position describe replayed bytes.
+            reorder.clear();
+            // The window may have been resized while the link was down.
+            if let Ok(size) = terminal_size(io::stdin().as_fd()) {
+                note_terminal_size(size);
+                input.resize(size)?;
+            }
+            // Erasing the indicator leaves the bottom row blank, and a replay repaints
+            // everything except the row it was written over.
+            input.repaint_arrived();
+            input.request_repaint()?;
+            continue;
+        }
         let frame = match next_frame(&mut inbound, &mut scratch, &display) {
             Ok(frame) => frame,
             Err(error) if error.is_transport_loss() => {
@@ -755,67 +851,7 @@ pub fn run(
                 // The terminal misses whatever the application does meanwhile, so the next
                 // screen restates every mode rather than diffing.
                 log!("link lost ({error}); prediction and screen model reset");
-                input.disconnect()?;
-                display.lock()?.invalidate();
-                drop(transport.take());
-                let resumed = match reconnect(
-                    destination,
-                    &Reopen::Session(&state),
-                    &input,
-                    &StatusLine(&display),
-                ) {
-                    Ok(Reconnected::Link(resumed)) => resumed,
-                    Ok(Reconnected::Closed) => {
-                        checkpoint.force(&state);
-                        display.lock()?.teardown()?;
-                        drop(raw);
-                        eprintln!("[brd] detached; reattach with: brd {destination}");
-                        return Ok(());
-                    }
-                    // Terminal here, unlike the forward-only client: a fresh session in
-                    // place of this user's shell is an empty screen where their work was.
-                    Ok(Reconnected::Gone) => {
-                        let _ = display.lock().map(|mut display| display.teardown());
-                        drop(raw);
-                        return Err(ClientError::Remote(RejectReason::UnknownSession));
-                    }
-                    // The indicator owns the bottom row of a raw-mode screen.
-                    Err(error) => {
-                        let _ = display.lock().map(|mut display| display.teardown());
-                        drop(raw);
-                        return Err(error);
-                    }
-                };
-                transport = Some(resumed.transport);
-                // A replacement transport has measured nothing yet.
-                deadline.set(LINK_TIMEOUT);
-                inbound = Inbound::ssh(resumed.output, deadline.clone())?;
-                version = resumed.version;
-                input.reconnect(Link::Ssh(Outbox::new(resumed.input)), resumed.version)?;
-                // Before the repaint, so the screen is owed on the attachment that survives.
-                if let Some((datagrams, spoken)) =
-                    upgrade(resumed.offer, &state, &deadline, &input)?
-                {
-                    inbound = datagrams;
-                    version = spoken;
-                    transport = None;
-                }
-                // Every forward held bytes against a sink that refused them, and the pump
-                // thread cannot see this event for itself.
-                if let Some(forwards) = forwards.as_ref() {
-                    forwards.link_restored();
-                }
-                // Chunks held against the old stream position describe replayed bytes.
-                reorder.clear();
-                // The window may have been resized while the link was down.
-                if let Ok(size) = terminal_size(io::stdin().as_fd()) {
-                    note_terminal_size(size);
-                    input.resize(size)?;
-                }
-                // Erasing the indicator leaves the bottom row blank, and a replay repaints
-                // everything except the row it was written over.
-                input.repaint_arrived();
-                input.request_repaint()?;
+                relink = true;
                 continue;
             }
             Err(error) => return Err(ClientError::Protocol(error)),
@@ -943,23 +979,29 @@ pub fn run(
                 skipped = skipped.saturating_add(bytes);
                 log!("session skipped {bytes} bytes of output on resume ({skipped} total)");
             }
-            ServerMessage::Detached { reason } => {
-                // The session outlives this attachment, so the checkpoint must name it again.
-                checkpoint.force(&state);
-                display.lock()?.teardown()?;
-                drop(raw);
-                drop(transport);
-                match reason {
-                    DetachReason::Requested => {
-                        eprintln!("[brd] detached; reattach with: brd {destination}");
-                    }
-                    DetachReason::Replaced => {
-                        eprintln!("[brd] another client took over this session");
-                    }
+            ServerMessage::Detached { reason } => match reason {
+                DetachReason::Requested => {
+                    // The session outlives this attachment, so the checkpoint must name it again.
+                    checkpoint.force(&state);
+                    display.lock()?.teardown()?;
+                    drop(raw);
+                    drop(transport);
+                    eprintln!("[brd] detached; reattach with: brd {destination}");
+                    report_skipped(skipped, destination);
+                    return Ok(());
                 }
-                report_skipped(skipped, destination);
-                return Ok(());
-            }
+                // Never another client: the id a resume carries is drawn per
+                // process, so this names an attachment one of this client's own
+                // resumes replaced, and the shell behind it is still running.
+                // Ending here hands the user a dead terminal for a live session.
+                DetachReason::Replaced => {
+                    log!("attachment replaced by this client's own resume; relinking");
+                    // Proof that the resume behind it arrived, so a further
+                    // offer would cost the attachment this is about to take.
+                    offers_wanted = false;
+                    relink = true;
+                }
+            },
             ServerMessage::CommandAck { highest } => {
                 if let Some(highest) = highest {
                     input.acknowledge(highest)?;
@@ -2905,15 +2947,23 @@ mod tests {
 
         let state = ReconnectState::new(SessionId::from_bytes([5; 16]), capability(6));
         assert!(
-            take_offer(&offer(port), &state, &Deadline::new(LINK_TIMEOUT)).is_some(),
+            matches!(
+                take_offer(&offer(port), &state, &Deadline::new(LINK_TIMEOUT)),
+                Offer::Taken(..)
+            ),
             "an offer that answers carries the session"
         );
         answering.join().expect("the daemon half finishes");
     }
 
-    /// Never retried: the probes run out and the session stays on the transport carrying it.
+    /// The probes run out, but the resume they carried is destructive on
+    /// arrival: whether it reached the daemon is exactly what is unknown, and
+    /// a daemon that received one has already dropped the `ssh` attachment and
+    /// said so down it. Reporting this as an ordinary refusal loses that
+    /// distinction, and a caller that treats the `Detached` behind it as an
+    /// eviction tears down a terminal whose shell is still running.
     #[test]
-    fn an_offer_nothing_answers_leaves_the_session_on_ssh() {
+    fn an_offer_nothing_answers_is_spent_rather_than_merely_declined() {
         // Bound and then dropped, which is what a firewalled datagram path looks like.
         let port = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .and_then(|socket| socket.local_addr())
@@ -2921,7 +2971,10 @@ mod tests {
             .port();
         let state = ReconnectState::new(SessionId::from_bytes([5; 16]), capability(6));
         let deadline = Deadline::new(LINK_TIMEOUT);
-        assert!(take_offer(&offer(port), &state, &deadline).is_none());
+        assert!(
+            matches!(take_offer(&offer(port), &state, &deadline), Offer::Spent),
+            "a resume left this process, so ssh is no longer a fallback"
+        );
         assert_eq!(
             deadline.get(),
             LINK_TIMEOUT,
