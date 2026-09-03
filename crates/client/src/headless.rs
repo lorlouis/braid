@@ -355,7 +355,8 @@ fn serve(
             | ServerMessage::Hello { .. }
             | ServerMessage::HelloForward { .. }
             | ServerMessage::SessionList { .. }
-            | ServerMessage::SearchResults { .. } => {
+            | ServerMessage::SearchResults { .. }
+            | ServerMessage::SessionNames { .. } => {
                 return Err(ClientError::Protocol(
                     braid_proto::DecodeError::InvalidField,
                 ));

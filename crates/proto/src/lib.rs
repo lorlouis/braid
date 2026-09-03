@@ -17,7 +17,7 @@ pub use screen::{
     ScrollBand, StickyState, StyleAttrs, StyleColor, StyleRun, UnderlineStyle,
 };
 
-pub const PROTOCOL_VERSION: u16 = 16;
+pub const PROTOCOL_VERSION: u16 = 17;
 
 /// The oldest frame layout this build decodes. Appending a field or a message raises
 /// [`PROTOCOL_VERSION`] and leaves this alone; raising *this* is a flag day.
@@ -159,6 +159,9 @@ pub const MAX_ENV_VARS: usize = 16;
 pub const MAX_SESSIONS: usize = 256;
 pub const MAX_COMMAND: usize = 128;
 pub const MAX_COMMAND_WORDS: usize = 16;
+/// Bytes of a session's name: a label a human types and a table column prints,
+/// so it is bounded well under the command beside it.
+pub const MAX_SESSION_NAME: usize = 64;
 /// Attachments one session will carry at once: each costs a thread, a sink and a
 /// screen ledger holding two row snapshots.
 pub const MAX_ATTACHMENTS: usize = 8;
@@ -480,6 +483,17 @@ pub struct SessionSummary {
     pub command: String,
 }
 
+/// The label a user gave one session, carried apart from [`SessionSummary`] rather than
+/// inside it: that summary is [`MANAGEMENT_VERSION`]'s frozen layout, and a field appended
+/// to it would be read by an older peer as the next session's identifier.
+///
+/// Only named sessions appear in a list of these, so an absent id is an unnamed session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionName {
+    pub session_id: SessionId,
+    pub name: String,
+}
+
 /// One `brd` process, stable across every reconnect it makes. A resume replaces the
 /// attachment carrying the same id; anything else joins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -568,6 +582,18 @@ pub enum ClientMessage {
         pattern: String,
         limit: u16,
     },
+    /// Name one session, or clear its name when `name` is empty. Answered with the whole
+    /// list, which is the only confirmation a management connection has.
+    ///
+    /// Management may gain a *message* where it may not gain a field: a daemon too old to
+    /// know this tag hangs up rather than misreading it, and the client sends it only after
+    /// the frozen exchange it opened with has already been answered.
+    RenameSession {
+        session_id: SessionId,
+        name: String,
+    },
+    /// The name of every named session, beside [`Self::ListSessions`] rather than inside it.
+    ListNames,
     /// Open a forwarded connection to `target`, under a number this client allocated. The
     /// only sequenced message a forward has; a lost payload must not stall the command gate.
     ForwardOpen {
@@ -973,6 +999,11 @@ pub enum ServerMessage {
     /// everything. Diagnostic only — nothing is repaired by it.
     OutputSkipped {
         bytes: u64,
+    },
+    /// Answer to [`ClientMessage::ListNames`] and to [`ClientMessage::RenameSession`],
+    /// spoken at [`Version::MANAGEMENT`] beside the other management answers.
+    SessionNames {
+        names: Vec<SessionName>,
     },
 }
 pub(crate) fn put_u16(out: &mut Vec<u8>, value: u16) {
@@ -2186,6 +2217,69 @@ ref_field! {
 }
 
 ref_field! {
+    /// One session's label. Reaches a terminal through `brd ls`, so it is control-checked
+    /// like every other string this protocol carries; empty is legal and means unnamed.
+    Name: String as str,
+    hint(|value| 1 + value.len()),
+    put(|out, value| {
+        let len = u8::try_from(value.len()).map_err(|_| EncodeError::BadSessionName)?;
+        if usize::from(len) > MAX_SESSION_NAME || has_control(value) {
+            return Err(EncodeError::BadSessionName);
+        }
+        out.push(len);
+        out.extend_from_slice(value.as_bytes());
+        Ok(())
+    }),
+    get(|c| {
+        let len = usize::from(c.u8()?);
+        if len > MAX_SESSION_NAME {
+            return Err(DecodeError::InvalidField);
+        }
+        let name = c.str(len)?.to_owned();
+        reject_control(&name)?;
+        Ok(name)
+    })
+}
+
+ref_field! {
+    /// Only named sessions travel in one of these, so an empty name is a contradiction
+    /// rather than an unnamed session, and is refused at both ends.
+    Names: Vec<SessionName> as [SessionName],
+    hint(|value| 2 + value.iter().map(|named| 17 + named.name.len()).sum::<usize>()),
+    put(|out, value| {
+        if value.len() > MAX_SESSIONS {
+            return Err(EncodeError::Oversize);
+        }
+        let count = u16::try_from(value.len()).map_err(|_| EncodeError::Oversize)?;
+        put_u16(out, count);
+        for named in value {
+            if named.name.is_empty() {
+                return Err(EncodeError::BadSessionName);
+            }
+            out.extend_from_slice(&named.session_id.as_bytes());
+            <Name as Field>::put(out, &named.name)?;
+        }
+        Ok(())
+    }),
+    get(|c| {
+        let count = usize::from(c.u16()?);
+        if count > MAX_SESSIONS {
+            return Err(DecodeError::InvalidField);
+        }
+        let mut names = Vec::with_capacity(count.min(c.remaining() / 17));
+        for _ in 0..count {
+            let session_id = SessionId(c.array()?);
+            let name = <Name as Field>::get(c)?;
+            if name.is_empty() {
+                return Err(DecodeError::InvalidField);
+            }
+            names.push(SessionName { session_id, name });
+        }
+        Ok(names)
+    })
+}
+
+ref_field! {
     Matches: Vec<SearchMatch> as [SearchMatch],
     hint(|value| 2 + value.iter().map(|found| 24 + found.line.len()).sum::<usize>()),
     put(|out, value| {
@@ -2574,6 +2668,14 @@ messages! {
         stream: StreamNum,
         reason: Reset,
     }
+    // Appended last, so every tag before them keeps the number it had. A management
+    // dialect gains messages this way and fields never: an unknown tag is refused whole,
+    // where a field appended to a frozen message is read as the next one's bytes.
+    RenameSession {
+        session_id: Session,
+        name: Name,
+    }
+    ListNames {}
 }
 
 messages! {
@@ -2640,9 +2742,12 @@ messages! {
         stream: StreamNum,
         reason: Reset,
     }
-    // Appended last, so every tag before it keeps the number it had.
+    // Appended last, so every tag before them keeps the number it had.
     OutputSkipped {
         bytes: U64,
+    }
+    SessionNames {
+        names: Names,
     }
 }
 
@@ -2895,6 +3000,16 @@ mod tests {
                     0, 0, 0, 17, 13, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
                 ][..],
             ),
+            (
+                ClientMessage::RenameSession {
+                    session_id: SessionId::from_bytes([5; 16]),
+                    name: "ci".to_owned(),
+                },
+                &[
+                    0, 0, 0, 20, 19, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 2, b'c', b'i',
+                ][..],
+            ),
+            (ClientMessage::ListNames, &[0, 0, 0, 1, 20][..]),
         ] {
             assert_eq!(
                 message
@@ -2930,6 +3045,18 @@ mod tests {
                     sessions: Vec::new(),
                 },
                 &[0, 0, 0, 3, 0x89, 0, 0][..],
+            ),
+            (
+                ServerMessage::SessionNames {
+                    names: vec![SessionName {
+                        session_id: SessionId::from_bytes([7; 16]),
+                        name: "ci".to_owned(),
+                    }],
+                },
+                &[
+                    0, 0, 0, 22, 0x90, 0, 1, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 2,
+                    b'c', b'i',
+                ][..],
             ),
         ] {
             assert_eq!(

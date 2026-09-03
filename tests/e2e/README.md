@@ -11,9 +11,10 @@ from a cold start settle on one that a client can still reach, a session leaves 
 the datagram transport and falls back to the pipe when it cannot, a 400-column screen of
 dense colour and one of emoji leave the session alive on that transport, typing and
 backspacing through a delayed link cost no round trip and no repaint, sessions can be
-listed and reached by id prefix, a line scrolled out of the viewport is still found by
-`brd grep`, and a program that neither reads its input nor stops writing does not wedge
-the session against its own quit key.
+listed and reached by id prefix, `brd new` stands a session beside the ones already
+running and `brd rename` gives one a name the next `brd ls` prints, a line scrolled out
+of the viewport is still found by `brd grep`, and a program that neither reads its input
+nor stops writing does not wedge the session against its own quit key.
 
 Requires passwordless SSH (key auth) to `$BRD_E2E_DEST` and an installed `brd` on `PATH`.
 Not part of `cargo test`: opt in with `BRD_E2E=1`, otherwise every script exits 0 with a

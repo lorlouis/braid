@@ -49,7 +49,8 @@ use crate::state::{load_ticket, persist_ticket, private_dir, state_dir, ticket_p
 use braid_proto::{
     ByteOff, ClientMessage, ConfirmedOutput, DatagramOffer, MAX_CLIENT_FRAME, MAX_FORWARD_CHUNK,
     MAX_MATCHES, MAX_OUTPUT_CHUNK, MAX_SESSIONS, RejectReason, SearchMatch, ServerMessage,
-    SessionId, SessionSummary, Version, VersionRange, read_frame, read_frame_into, write_message,
+    SessionId, SessionName, SessionSummary, Version, VersionRange, read_frame, read_frame_into,
+    write_message,
 };
 use braid_vt::EffectSink;
 use rustix::fs::RawMode;
@@ -634,6 +635,8 @@ fn serve_attachment(
         ClientMessage::ListSessions
             | ClientMessage::KillSession { .. }
             | ClientMessage::Search { .. }
+            | ClientMessage::ListNames
+            | ClientMessage::RenameSession { .. }
     ) {
         return serve_management(input, output, daemon, first);
     }
@@ -769,6 +772,15 @@ fn serve_management(
             ClientMessage::Search { pattern, limit } => ServerMessage::SearchResults {
                 matches: search_sessions(daemon, &pattern, usize::from(limit)),
             },
+            ClientMessage::RenameSession { session_id, name } => {
+                rename_session(daemon, session_id, name);
+                ServerMessage::SessionNames {
+                    names: session_names(daemon),
+                }
+            }
+            ClientMessage::ListNames => ServerMessage::SessionNames {
+                names: session_names(daemon),
+            },
             _ => return Ok(()),
         };
         write_message(&mut output, &answer.encode(Version::MANAGEMENT)?)?;
@@ -792,6 +804,25 @@ fn session_list(daemon: &DaemonState) -> Vec<SessionSummary> {
     summaries.sort_by(newest_first);
     summaries.truncate(MAX_SESSIONS);
     summaries
+}
+
+/// The name of every session this daemon owns that has one.
+fn session_names(daemon: &DaemonState) -> Vec<SessionName> {
+    let mut names: Vec<SessionName> = registry(daemon)
+        .sessions
+        .iter()
+        .filter_map(|(id, handle)| handle.info.named(*id))
+        .collect();
+    names.truncate(MAX_SESSIONS);
+    names
+}
+
+/// Name one session, or clear its name when `name` is empty. A session that is gone is
+/// not an error here: the list this is answered with says so, as it does for a kill.
+fn rename_session(daemon: &DaemonState, session_id: SessionId, name: String) {
+    if let Some(handle) = registry(daemon).sessions.get(&session_id) {
+        handle.info.rename(name);
+    }
 }
 
 /// End one session and its shell, through the path `Close` takes.
@@ -1145,6 +1176,77 @@ mod tests {
         );
         assert!(!registry(&daemon).sessions.contains_key(&session_id));
         assert!(!ticket_path(session_id).exists());
+    }
+
+    fn names_after(daemon: &Arc<DaemonState>, request: &ClientMessage) -> Vec<SessionName> {
+        let answered = served(
+            daemon,
+            request
+                .encode(Version::LOCAL)
+                .expect("encode a name request"),
+        );
+        let Some(ServerMessage::SessionNames { names }) = answered
+            .frames()
+            .into_iter()
+            .find(|message| matches!(message, ServerMessage::SessionNames { .. }))
+        else {
+            panic!("a name request is answered with the names it leaves behind");
+        };
+        names
+    }
+
+    /// A name belongs to the session rather than to the client that gave it,
+    /// so it outlives that connection and answers the next `brd ls` from any
+    /// other. Empty clears it, which is how a session leaves the list.
+    #[test]
+    fn a_session_keeps_the_name_a_management_connection_gave_it() {
+        let daemon = Arc::new(DaemonState::default());
+        let ticket = sessions::SessionTicket::issue().expect("session ticket");
+        let session_id = ticket.session_id;
+        daemon_session(&daemon, ticket, &[]);
+        assert!(
+            session_names(&daemon).is_empty(),
+            "a session is unnamed until something names it"
+        );
+
+        let named = names_after(
+            &daemon,
+            &ClientMessage::RenameSession {
+                session_id,
+                name: "deploy".to_owned(),
+            },
+        );
+        assert_eq!(
+            named,
+            vec![SessionName {
+                session_id,
+                name: "deploy".to_owned(),
+            }],
+            "a rename is answered with the names it leaves behind"
+        );
+        assert_eq!(
+            names_after(&daemon, &ClientMessage::ListNames),
+            named,
+            "a second connection sees the name the first one set"
+        );
+        assert!(
+            names_after(
+                &daemon,
+                &ClientMessage::RenameSession {
+                    session_id,
+                    name: String::new(),
+                }
+            )
+            .is_empty(),
+            "an empty name clears it, and an unnamed session is in no list"
+        );
+
+        let _ = served(
+            &daemon,
+            ClientMessage::KillSession { session_id }
+                .encode(Version::LOCAL)
+                .expect("encode kill"),
+        );
     }
 
     /// `brd ls` has to name what actually runs, or the list a user kills from

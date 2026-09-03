@@ -495,13 +495,28 @@ fn status_size() -> GridSize {
     .unwrap_or(GridSize { cols: 80, rows: 24 })
 }
 
-/// `None` takes the newest; a prefix resolves as `brd kill` does, empty refused.
+/// Which session a client is asking for. A selector rather than an `Option<&str>`: "the
+/// newest one" and "one of my own" are different requests, not an absent prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attach<'a> {
+    /// The newest session this client remembers on that host, or a fresh one when it
+    /// remembers none.
+    Newest,
+    /// The one remembered session this prefix names, resolved as `brd kill` resolves.
+    Prefix(&'a str),
+    /// A session of its own, beside whatever is already running there.
+    Fresh,
+}
+
 fn take_session(
     sessions: &mut Vec<ReconnectState>,
-    selector: Option<&str>,
+    wanted: Attach<'_>,
 ) -> Result<Option<ReconnectState>, ClientError> {
-    let Some(prefix) = selector else {
-        return Ok((!sessions.is_empty()).then(|| sessions.remove(0)));
+    let prefix = match wanted {
+        // Nothing is taken, so every remembered session stays in the checkpoint.
+        Attach::Fresh => return Ok(None),
+        Attach::Newest => return Ok((!sessions.is_empty()).then(|| sessions.remove(0))),
+        Attach::Prefix(prefix) => prefix,
     };
     let ids: Vec<SessionId> = sessions.iter().map(|state| state.session_id).collect();
     let wanted = manage::resolve(&ids, prefix)?;
@@ -584,12 +599,12 @@ fn report_skipped(bytes: u64, destination: &str) {
 }
 
 /// Attach to `destination`, running `command` instead of a login shell when it
-/// is not empty and resuming the stored session `session` names.
+/// is not empty and resuming the session `wanted` names.
 #[expect(clippy::too_many_lines, reason = "one session lifecycle")]
 pub fn run(
     destination: &str,
     command: &[String],
-    session: Option<&str>,
+    wanted: Attach<'_>,
     prediction: Prediction,
     forwards: &[ForwardSpec],
 ) -> Result<(), ClientError> {
@@ -607,7 +622,7 @@ pub fn run(
     let mut remembered = checkpoint.load()?;
     // Resuming would drop the command the user typed and hand back a shell instead.
     let previous_state = if command.is_empty() {
-        take_session(&mut remembered, session)?
+        take_session(&mut remembered, wanted)?
     } else {
         None
     };
@@ -1069,7 +1084,8 @@ pub fn run(
             | ServerMessage::Hello { .. }
             | ServerMessage::HelloForward { .. }
             | ServerMessage::SessionList { .. }
-            | ServerMessage::SearchResults { .. } => {
+            | ServerMessage::SearchResults { .. }
+            | ServerMessage::SessionNames { .. } => {
                 return Err(ClientError::Protocol(
                     braid_proto::DecodeError::InvalidField,
                 ));
@@ -1944,7 +1960,7 @@ mod tests {
         let refused = run(
             "brd.invalid",
             &[],
-            None,
+            Attach::Newest,
             Prediction::Never,
             std::slice::from_ref(&spec),
         )
@@ -2120,7 +2136,7 @@ mod tests {
         let mut checkpoint = Checkpoint::new(Some(path.clone()));
         checkpoint.force(&first);
         let mut remembered = checkpoint.load().expect("readable");
-        let resumed = take_session(&mut remembered, None)
+        let resumed = take_session(&mut remembered, Attach::Newest)
             .expect("resolved")
             .expect("present");
         assert_eq!(resumed.session_id, first.session_id);
@@ -2235,18 +2251,24 @@ mod tests {
             ReconnectState::new(SessionId::from_bytes([0xab; 16]), capability(1)),
             ReconnectState::new(SessionId::from_bytes([0xac; 16]), capability(2)),
         ];
-        assert!(take_session(&mut sessions.clone(), Some("")).is_err());
+        assert!(take_session(&mut sessions.clone(), Attach::Prefix("")).is_err());
         assert!(
-            take_session(&mut sessions.clone(), Some("a")).is_err(),
+            take_session(&mut sessions.clone(), Attach::Prefix("a")).is_err(),
             "both start with a"
         );
-        let picked = take_session(&mut sessions, Some("ac"))
+        assert!(
+            take_session(&mut sessions.clone(), Attach::Fresh)
+                .expect("resolved")
+                .is_none(),
+            "`brd new` resumes nothing and takes nothing off the list"
+        );
+        let picked = take_session(&mut sessions, Attach::Prefix("ac"))
             .expect("resolved")
             .expect("present");
         assert_eq!(picked.session_id, SessionId::from_bytes([0xac; 16]));
         assert_eq!(sessions.len(), 1, "the chosen session leaves the list");
 
-        let newest = take_session(&mut sessions, None)
+        let newest = take_session(&mut sessions, Attach::Newest)
             .expect("resolved")
             .expect("present");
         assert_eq!(newest.session_id, SessionId::from_bytes([0xab; 16]));

@@ -7,12 +7,12 @@ use braid_proto::{
     ForwardResetReason, ForwardTarget, Generation, GridSize, InputCue, MAX_ATTACHMENTS,
     MAX_CLIENT_FRAME, MAX_COMMAND, MAX_COMMAND_WORDS, MAX_DEFERRED, MAX_DEFERRED_BYTES, MAX_ENV,
     MAX_ENV_VARS, MAX_FORWARD_CHUNK, MAX_FORWARD_HOST, MAX_FRAME, MAX_INPUT_CHUNK, MAX_MATCH_LINE,
-    MAX_MATCHES, MAX_OUTPUT_CHUNK, MAX_PATTERN, MAX_RUN_BYTES, MAX_SESSIONS, MAX_TERM, MAX_TITLE,
-    MIN_DATAGRAM_FRAME, ModeSet, RejectReason, ResumeRequest, RowChunk, RowFrame, RowSpan,
-    RowUpdate, SackRuns, ScreenHeader, ScreenPart, ScreenVersion, ScrollBand, SearchMatch,
-    ServerMessage, SessionEnv, SessionId, SessionSummary, StickyState, StreamId, StyleAttrs,
-    StyleColor, StyleRun, UnderlineStyle, Version, VersionRange, encode_screen_parts, read_frame,
-    screen::MAX_CLUSTER_BYTES,
+    MAX_MATCHES, MAX_OUTPUT_CHUNK, MAX_PATTERN, MAX_RUN_BYTES, MAX_SESSION_NAME, MAX_SESSIONS,
+    MAX_TERM, MAX_TITLE, MIN_DATAGRAM_FRAME, ModeSet, RejectReason, ResumeRequest, RowChunk,
+    RowFrame, RowSpan, RowUpdate, SackRuns, ScreenHeader, ScreenPart, ScreenVersion, ScrollBand,
+    SearchMatch, ServerMessage, SessionEnv, SessionId, SessionName, SessionSummary, StickyState,
+    StreamId, StyleAttrs, StyleColor, StyleRun, UnderlineStyle, Version, VersionRange,
+    encode_screen_parts, read_frame, screen::MAX_CLUSTER_BYTES,
 };
 use std::collections::HashSet;
 use std::io::Cursor;
@@ -590,6 +590,34 @@ fn session_list(rng: &mut Rng) -> Vec<SessionSummary> {
         .collect()
 }
 
+/// At `MAX_SESSION_NAME`, past it, the empty name a list may not carry, and control bytes.
+fn session_name(rng: &mut Rng) -> String {
+    match rng.below(8) {
+        0 => "n".repeat(MAX_SESSION_NAME),
+        1 => "n".repeat(MAX_SESSION_NAME + 1),
+        2 => String::new(),
+        3 => format!("build\u{1b}[2J{}", rng.below(9)),
+        _ => short_text(rng, 16),
+    }
+}
+
+/// None, `MAX_SESSIONS`, and one past it.
+fn session_names(rng: &mut Rng) -> Vec<SessionName> {
+    let bound = u64::try_from(MAX_SESSIONS).expect("a session count");
+    let count = match rng.below(8) {
+        0 => bound,
+        1 => bound + 1,
+        2 => 0,
+        _ => rng.below(6),
+    };
+    (0..count)
+        .map(|_| SessionName {
+            session_id: session_id(rng),
+            name: session_name(rng),
+        })
+        .collect()
+}
+
 /// None, `MAX_MATCHES`, and one past it.
 fn search_matches(rng: &mut Rng) -> Vec<SearchMatch> {
     let bound = u64::try_from(MAX_MATCHES).expect("a match count");
@@ -741,6 +769,11 @@ fn client_message(rng: &mut Rng, kind: u64) -> ClientMessage {
             stream: stream_id(rng),
             reason: forward_reset_reason(rng),
         },
+        17 => ClientMessage::RenameSession {
+            session_id: session_id(rng),
+            name: session_name(rng),
+        },
+        18 => ClientMessage::ListNames,
         _ => ClientMessage::HelloForward {
             versions: VersionRange::LOCAL,
             client: client_id(rng),
@@ -808,6 +841,9 @@ fn server_message(rng: &mut Rng, kind: u64) -> ServerMessage {
         12 => ServerMessage::ForwardReset {
             stream: stream_id(rng),
             reason: forward_reset_reason(rng),
+        },
+        13 => ServerMessage::SessionNames {
+            names: session_names(rng),
         },
         _ => ServerMessage::HelloForward {
             version: Version::LOCAL,
@@ -906,6 +942,9 @@ fn client_refusal(msg: &ClientMessage) -> Option<EncodeError> {
             || pattern.len() > MAX_PATTERN
             || pattern.chars().any(char::is_control))
         .then_some(EncodeError::BadPattern),
+        ClientMessage::RenameSession { name, .. } => (name.len() > MAX_SESSION_NAME
+            || name.chars().any(char::is_control))
+        .then_some(EncodeError::BadSessionName),
         ClientMessage::ForwardOpen { target, .. } => (target.host.is_empty()
             || target.host.len() > MAX_FORWARD_HOST
             || target.host.chars().any(char::is_control)
@@ -932,6 +971,20 @@ fn server_refusal(msg: &ServerMessage) -> Option<EncodeError> {
                     .any(|session| {
                         session.command.len() > MAX_COMMAND
                             || session.command.chars().any(char::is_control)
+                    })
+                    .then_some(EncodeError::BadSessionName)
+            }
+        }
+        ServerMessage::SessionNames { names } => {
+            if names.len() > MAX_SESSIONS {
+                Some(EncodeError::Oversize)
+            } else {
+                names
+                    .iter()
+                    .any(|named| {
+                        named.name.is_empty()
+                            || named.name.len() > MAX_SESSION_NAME
+                            || named.name.chars().any(char::is_control)
                     })
                     .then_some(EncodeError::BadSessionName)
             }
@@ -1289,8 +1342,8 @@ fn check_server(msg: &ServerMessage, coverage: &mut Coverage) {
     }
 }
 
-const CLIENT_VARIANTS: usize = 18;
-const SERVER_VARIANTS: usize = 14;
+const CLIENT_VARIANTS: usize = 20;
+const SERVER_VARIANTS: usize = 15;
 /// Divisible by both, so every variant is generated the same number of times.
 const CASES: u64 = 12_600;
 
@@ -1436,6 +1489,11 @@ fn client_corpus() -> Vec<Vec<u8>> {
             stream: StreamId::first(),
             reason: ForwardResetReason::Refused,
         },
+        ClientMessage::RenameSession {
+            session_id: session_id(&mut rng),
+            name: String::from("deploy"),
+        },
+        ClientMessage::ListNames,
         ClientMessage::HelloForward {
             versions: VersionRange::LOCAL,
             client: ClientId::from_bytes([0x5A; 16]),
@@ -1629,6 +1687,12 @@ fn one_of_each(rng: &mut Rng, size: GridSize, header: &ScreenHeader) -> Vec<Vec<
         ServerMessage::ForwardReset {
             stream: StreamId::first(),
             reason: ForwardResetReason::Unreachable,
+        },
+        ServerMessage::SessionNames {
+            names: vec![SessionName {
+                session_id: session_id(rng),
+                name: String::from("deploy"),
+            }],
         },
         ServerMessage::HelloForward {
             version: Version::LOCAL,
