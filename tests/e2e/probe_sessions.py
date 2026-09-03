@@ -4,7 +4,9 @@
 A client holds one capability per destination per session, so a second
 `brd host` neither overwrites the first's nor orphans it. Both halves are
 checked against a real daemon: a session runs the argv it was given, and an
-older one is still reachable by any unambiguous prefix of its id.
+older one is still reachable by any unambiguous prefix of its id. `brd new`
+is the form that must never resume, and the name `brd rename` gives a session
+lives on the daemon, so the next `brd ls` prints it.
 """
 
 import os
@@ -104,8 +106,60 @@ results.append(check("an empty prefix is refused rather than guessed", subproces
     [BRD, "attach", DEST, ""], capture_output=True, text=True, timeout=30
 ).returncode != 0))
 
+
+def settled(count, timeout=10.0):
+    """The listing once it names `count` sessions, or once the wait is over."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows = ids(listing())
+        if len(rows) == count:
+            return rows
+        time.sleep(0.3)
+    return ids(listing())
+
+
+# A bare `brd` just landed in the newest session; this asks for one beside it,
+# with no command to force the point — `--` already refuses to resume.
+made = Session(argv=[BRD, "new", DEST])
+rows = settled(3)
+results.append(check(f"brd new starts a session rather than resuming one ({len(rows)})", len(rows) == 3))
+made.send(DETACH)
+made.wait()
+
+
+def rename(session_id, name):
+    return subprocess.run(
+        [BRD, "rename", DEST, session_id, name], capture_output=True, text=True, timeout=30
+    )
+
+
+if rows:
+    target = rows[0]
+    results.append(check("a session is renamed by id prefix", rename(target[:4], "deploy").returncode == 0))
+    # A second `brd ls`, over a connection of its own: the name is the
+    # daemon's, not something the renaming client remembered.
+    table = listing()
+    header, *body = table.splitlines()
+    results.append(
+        check(
+            "the name is listed beside the id that carries it",
+            "NAME" in header
+            and any(row.startswith(target) and "deploy" in row for row in body),
+        )
+    )
+    results.append(
+        check(
+            "an unnamed session keeps its row",
+            sum(1 for row in body if "deploy" in row) == 1 and len(body) == 3,
+        )
+    )
+    results.append(check("an empty name clears it", rename(target, "").returncode == 0
+                         and "NAME" not in listing().splitlines()[0]))
+
+results.append(check("a name for no session is refused", rename("ffffffff", "x").returncode != 0))
+
 # The sessions are the probe's, not the user's.
-for session_id in named:
+for session_id in ids(listing()):
     subprocess.run([BRD, "kill", DEST, session_id], capture_output=True, timeout=30)
 time.sleep(0.5)
 results.append(check("every session the probe made is gone", not ids(listing())))

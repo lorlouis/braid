@@ -57,10 +57,18 @@ pub fn run_server() -> Result<(), ServerError> {
     // at both ends: sshd resolved `brd --server` through PATH, so this process
     // is always the new binary and the daemon it answers for may be older.
     loop {
-        let sessions = match ClientMessage::decode(&payload, Version::MANAGEMENT) {
+        let found = match ClientMessage::decode(&payload, Version::MANAGEMENT) {
             Ok(ClientMessage::ListSessions) => manage_daemon(None),
             Ok(ClientMessage::KillSession { session_id }) => manage_daemon(Some(session_id)),
             _ => break,
+        };
+        let sessions = match found {
+            Daemon::Sessions(sessions) => sessions,
+            // A host that has never started a daemon is holding nothing.
+            Daemon::Absent => Vec::new(),
+            // Answered as a failure rather than as an empty list: a user told
+            // their sessions are gone stops looking for them.
+            Daemon::Silent(why) => return Err(ServerError::DaemonSilent(why)),
         };
         write_message(
             &mut stdout,
@@ -182,26 +190,39 @@ pub(crate) fn newest_first(a: &SessionSummary, b: &SessionSummary) -> std::cmp::
         .then_with(|| a.session_id.as_bytes().cmp(&b.session_id.as_bytes()))
 }
 
+/// What a management question found on the daemon socket.
+///
+/// A host that has never started a daemon has no sessions, and saying so is
+/// the truth. A daemon that could not be asked holds an unknown number of
+/// them, and the two must not render alike: `brd ls` is what a user reads to
+/// decide whether the work they left behind survived.
+enum Daemon {
+    Sessions(Vec<SessionSummary>),
+    Absent,
+    Silent(String),
+}
+
 /// One socket, because the socket name carries no protocol version: a stable
 /// name plus a negotiated handshake keeps a user's shells reachable across an
 /// upgrade.
-fn manage_daemon(kill: Option<SessionId>) -> Vec<SessionSummary> {
+fn manage_daemon(kill: Option<SessionId>) -> Daemon {
     let directory = state_dir();
-    // A socket in a directory someone else owns is not this user's daemon.
-    if private_dir(directory).is_err() {
-        return Vec::new();
+    // A directory this process cannot prove is the user's own is one it cannot
+    // read a socket out of, and someone else's daemon may be holding sessions.
+    if let Err(error) = private_dir(directory) {
+        return Daemon::Silent(error.to_string());
     }
-    let Some(mut sessions) = ask_daemon(&directory.join(socket_name()), kill) else {
-        return Vec::new();
-    };
-    sessions.sort_by(newest_first);
-    sessions.truncate(MAX_SESSIONS);
-    sessions
+    match ask_daemon(&directory.join(socket_name()), kill) {
+        Daemon::Sessions(mut sessions) => {
+            sessions.sort_by(newest_first);
+            sessions.truncate(MAX_SESSIONS);
+            Daemon::Sessions(sessions)
+        }
+        unanswered => unanswered,
+    }
 }
 
-/// `None` means this socket did not answer, which is not the same as a daemon
-/// with no sessions.
-fn ask_daemon(path: &std::path::Path, kill: Option<SessionId>) -> Option<Vec<SessionSummary>> {
+fn ask_daemon(path: &std::path::Path, kill: Option<SessionId>) -> Daemon {
     let mut socket = match open_daemon_socket(path) {
         Probe::Answered(socket) => socket,
         Probe::Unanswered => {
@@ -218,19 +239,24 @@ fn ask_daemon(path: &std::path::Path, kill: Option<SessionId>) -> Option<Vec<Ses
                 let _ = fs::remove_file(path);
                 drop(lock);
             }
-            return None;
+            return Daemon::Absent;
         }
-        Probe::Unknown => return None,
+        Probe::Unknown => return Daemon::Silent("its socket could not be opened".into()),
     };
     // `brd ls` waiting forever on a wedged daemon is the same failure as
     // `brd ls` not reaching it at all.
     let _ = socket.set_read_timeout(Some(MANAGE_DEADLINE));
-    let sessions = exchange(&mut socket, &ClientMessage::ListSessions)?;
+    let Some(sessions) = exchange(&mut socket, &ClientMessage::ListSessions) else {
+        return Daemon::Silent("it did not answer inside the deadline".into());
+    };
     let held = kill.filter(|wanted| sessions.iter().any(|summary| summary.session_id == *wanted));
     let Some(session_id) = held else {
-        return Some(sessions);
+        return Daemon::Sessions(sessions);
     };
-    exchange(&mut socket, &ClientMessage::KillSession { session_id })
+    match exchange(&mut socket, &ClientMessage::KillSession { session_id }) {
+        Some(remaining) => Daemon::Sessions(remaining),
+        None => Daemon::Silent("it did not answer the kill inside the deadline".into()),
+    }
 }
 
 /// Spoken at [`Version::MANAGEMENT`]: no version was negotiated on this connection.
@@ -415,6 +441,53 @@ mod tests {
             matches!(open_daemon_socket(&path), Probe::Unanswered),
             "a refused connect is the one proof this inode is stale"
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// `brd ls` is what a user reads to decide whether the shells they left
+    /// behind survived, so "no daemon on this host", "a daemon holding
+    /// nothing" and "a daemon that did not answer" must not render alike. The
+    /// third is what a wedged or overloaded daemon produces, and reporting it
+    /// as an empty host tells a user their running sessions are gone.
+    #[test]
+    fn a_daemon_that_did_not_answer_is_not_a_host_holding_no_sessions() {
+        use std::os::unix::net::UnixListener;
+
+        let path = env::temp_dir().join(format!("brd-ask-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        assert!(
+            matches!(ask_daemon(&path, None), Daemon::Absent),
+            "a host that never started a daemon is holding nothing"
+        );
+
+        // Accepts and hangs up: a daemon that is there and says nothing.
+        let listener = UnixListener::bind(&path).expect("a listening socket");
+        let mute = thread::spawn(move || drop(listener.accept()));
+        assert!(
+            matches!(ask_daemon(&path, None), Daemon::Silent(_)),
+            "a daemon that answered nothing must not read as an empty host"
+        );
+        mute.join().expect("the accepting thread");
+        let _ = fs::remove_file(&path);
+
+        let listener = UnixListener::bind(&path).expect("a listening socket");
+        let answering = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("a management connection");
+            read_frame(&mut socket, MAX_FRAME).expect("the request");
+            let list = ServerMessage::SessionList {
+                sessions: Vec::new(),
+            };
+            write_message(
+                &mut socket,
+                &list.encode(Version::MANAGEMENT).expect("a list encodes"),
+            )
+            .expect("the answer");
+        });
+        assert!(
+            matches!(ask_daemon(&path, None), Daemon::Sessions(held) if held.is_empty()),
+            "a daemon holding nothing still answers, and that empty list is real"
+        );
+        answering.join().expect("the answering thread");
         let _ = fs::remove_file(&path);
     }
 

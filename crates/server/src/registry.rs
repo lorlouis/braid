@@ -9,7 +9,9 @@ use crate::{
     ATTACHMENT_BYTES, CONNECTION_LIMIT, FORWARD_BYTES, FORWARD_LIMIT, FORWARD_SESSION_BYTES,
     MEMORY_BUDGET, SESSION_BYTES, SESSION_LIMIT, dgram,
 };
-use braid_proto::{DecodeError, GridSize, MAX_CLIENT_FRAME, SessionId, SessionSummary, read_frame};
+use braid_proto::{
+    DecodeError, GridSize, MAX_CLIENT_FRAME, SessionId, SessionName, SessionSummary, read_frame,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
@@ -171,6 +173,13 @@ impl Registry {
 /// first — and a session worth killing is often one that is busy.
 pub(crate) struct SessionInfo {
     pub(crate) command: String,
+    /// What `brd rename` called this session, empty until something does. A lock rather
+    /// than an atomic because it is a string, and never taken by the actor: management
+    /// is served on its own connection while the actor is busy with another.
+    ///
+    /// Bounded and control-free by the decoder that produced it, which is the only way
+    /// in.
+    name: Mutex<String>,
     pub(crate) cols: AtomicU16,
     pub(crate) rows: AtomicU16,
     /// A session is shared rather than owned, so this is a count not a flag.
@@ -183,6 +192,7 @@ impl SessionInfo {
     pub(crate) fn new(command: String, size: GridSize) -> Self {
         Self {
             command,
+            name: Mutex::default(),
             cols: AtomicU16::new(size.cols),
             rows: AtomicU16::new(size.rows),
             attachments: AtomicU16::new(0),
@@ -210,6 +220,20 @@ impl SessionInfo {
             active_unix: self.active_unix.load(Ordering::Relaxed),
             command: self.command.clone(),
         }
+    }
+
+    pub(crate) fn rename(&self, name: String) {
+        *self.name.lock().unwrap_or_else(PoisonError::into_inner) = name;
+    }
+
+    /// `None` for a session nothing has named: only named sessions travel in a
+    /// [`SessionName`] list, so an empty name would be a contradiction there.
+    pub(crate) fn named(&self, session_id: SessionId) -> Option<SessionName> {
+        let name = self.name.lock().unwrap_or_else(PoisonError::into_inner);
+        (!name.is_empty()).then(|| SessionName {
+            session_id,
+            name: name.clone(),
+        })
     }
 }
 

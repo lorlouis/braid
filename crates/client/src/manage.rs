@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `brd ls`, `brd kill` and `brd grep`.
+//! `brd ls`, `brd kill`, `brd grep` and `brd rename`.
 //!
 //! Every message here is spoken at [`Version::MANAGEMENT`]: none runs on a
 //! connection that handshook, and the daemon a user most needs to enumerate is
@@ -10,8 +10,8 @@ use crate::ClientError;
 use crate::inbound::{Deadline, DeadlineReader, RESUME_TIMEOUT};
 use crate::transport::{Auth, SshTransport};
 use braid_proto::{
-    ClientMessage, DecodeError, MAX_FRAME, MAX_MATCHES, SearchMatch, ServerMessage, SessionId,
-    SessionSummary, Version, read_frame, write_message,
+    ClientMessage, DecodeError, MAX_FRAME, MAX_MATCHES, MAX_SESSION_NAME, SearchMatch,
+    ServerMessage, SessionId, SessionName, SessionSummary, Version, read_frame, write_message,
 };
 use std::fmt::Write as _;
 use std::process::{ChildStdin, ChildStdout};
@@ -72,12 +72,29 @@ impl Management {
             _ => Err(ClientError::Protocol(DecodeError::InvalidField)),
         }
     }
+
+    fn names(&mut self, request: &ClientMessage) -> Result<Vec<SessionName>, ClientError> {
+        match self.ask(request)? {
+            ServerMessage::SessionNames { names } => Ok(names),
+            _ => Err(ClientError::Protocol(DecodeError::InvalidField)),
+        }
+    }
 }
 
 /// List the sessions the daemon on `destination` is holding.
 pub fn list(destination: &str) -> Result<(), ClientError> {
-    let sessions = Management::open(destination)?.sessions(&ClientMessage::ListSessions)?;
-    print_sessions(&sessions);
+    let mut daemon = Management::open(destination)?;
+    let sessions = daemon.sessions(&ClientMessage::ListSessions)?;
+    // Asked second, and a hangup here is not this command's failure: a daemon too old to
+    // know the tag ends the connection, and the sessions it has already listed are still
+    // the answer. Anything it does answer with is this connection failing, and a table
+    // silently missing its names is worse than saying so.
+    let names = match daemon.names(&ClientMessage::ListNames) {
+        Ok(names) => names,
+        Err(error) if hung_up(&error) => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    print_sessions(&sessions, &names);
     Ok(())
 }
 
@@ -99,6 +116,65 @@ pub fn kill(destination: &str, prefix: &str) -> Result<(), ClientError> {
         )));
     }
     Ok(())
+}
+
+/// Name one session on `destination`, or clear its name when `name` is empty.
+pub fn rename(destination: &str, prefix: &str, name: &str) -> Result<(), ClientError> {
+    // Refused here as well as by the wire, because the wire's refusal names no limit.
+    if name.len() > MAX_SESSION_NAME || name.chars().any(char::is_control) {
+        return Err(ClientError::Management(format!(
+            "a session name is at most {MAX_SESSION_NAME} bytes and carries no control characters"
+        )));
+    }
+    let mut daemon = Management::open(destination)?;
+    let sessions = daemon.sessions(&ClientMessage::ListSessions)?;
+    let ids: Vec<SessionId> = sessions.iter().map(|session| session.session_id).collect();
+    let session_id = resolve(&ids, prefix)?;
+    let named = daemon
+        .names(&ClientMessage::RenameSession {
+            session_id,
+            name: name.to_owned(),
+        })
+        .map_err(|error| unnameable(destination, error))?;
+    // The names the daemon has left are the only confirmation there is.
+    let held = named
+        .iter()
+        .find(|named| named.session_id == session_id)
+        .map_or("", |named| named.name.as_str());
+    if held != name {
+        return Err(ClientError::Management(format!(
+            "session {} was not renamed",
+            short_id(session_id)
+        )));
+    }
+    Ok(())
+}
+
+/// A daemon that answered the frozen question and then hung up on this one is a daemon
+/// that does not know the tag: management negotiates no version to be refused on, so the
+/// refusal is the connection ending. The link is proven by then — the session list came
+/// back over it — which is what makes this diagnosis rather than a guess.
+fn hung_up(error: &ClientError) -> bool {
+    match error {
+        ClientError::Protocol(cause) => cause.is_transport_loss(),
+        // The same loss, once `ask` found words on `ssh`'s own pipe to carry.
+        ClientError::Ssh(_) => true,
+        _ => false,
+    }
+}
+
+/// The relay's own words are kept for the case where something else ended it after all.
+fn unnameable(destination: &str, error: ClientError) -> ClientError {
+    if !hung_up(&error) {
+        return error;
+    }
+    let said = match &error {
+        ClientError::Ssh(diagnostics) => format!(" ({diagnostics})"),
+        _ => String::new(),
+    };
+    ClientError::Management(format!(
+        "the brd on {destination} is too old to name sessions{said}"
+    ))
 }
 
 /// Search every session's scrollback: the pattern travels, the history does not.
@@ -180,7 +256,11 @@ fn idle(seconds: u64) -> String {
 /// A session is shared rather than owned, so the client column is a count.
 const HEADERS: [&str; 5] = ["ID", "SIZE", "CLIENTS", "IDLE", "COMMAND"];
 
-fn print_sessions(sessions: &[SessionSummary]) {
+/// The same table on a daemon where something has a name. Two shapes rather than one
+/// with blanks in it: a column nothing fills is noise in every `brd ls` anyone runs.
+const NAMED_HEADERS: [&str; 6] = ["ID", "NAME", "SIZE", "CLIENTS", "IDLE", "COMMAND"];
+
+fn print_sessions(sessions: &[SessionSummary], names: &[SessionName]) {
     if sessions.is_empty() {
         println!("no sessions");
         return;
@@ -189,11 +269,16 @@ fn print_sessions(sessions: &[SessionSummary]) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    print!("{}", table(sessions, now));
+    let rows = rows(sessions, now);
+    if names.is_empty() {
+        print!("{}", table(HEADERS, &rows));
+    } else {
+        print!("{}", table(NAMED_HEADERS, &named(sessions, names, rows)));
+    }
 }
 
-fn table(sessions: &[SessionSummary], now: u64) -> String {
-    let rows: Vec<[String; 5]> = sessions
+fn rows(sessions: &[SessionSummary], now: u64) -> Vec<[String; 5]> {
+    sessions
         .iter()
         .map(|session| {
             [
@@ -204,24 +289,46 @@ fn table(sessions: &[SessionSummary], now: u64) -> String {
                 session.command.clone(),
             ]
         })
-        .collect();
+        .collect()
+}
+
+/// The name goes beside the id it belongs to; a session nothing named gets an empty cell.
+fn named(
+    sessions: &[SessionSummary],
+    names: &[SessionName],
+    rows: Vec<[String; 5]>,
+) -> Vec<[String; 6]> {
+    sessions
+        .iter()
+        .zip(rows)
+        .map(|(session, [id, size, clients, idle, command])| {
+            let name = names
+                .iter()
+                .find(|named| named.session_id == session.session_id)
+                .map_or_else(String::new, |named| named.name.clone());
+            [id, name, size, clients, idle, command]
+        })
+        .collect()
+}
+
+fn table<const N: usize>(headers: [&str; N], rows: &[[String; N]]) -> String {
     // A column is measured in cells; `cell.len()` is neither cells nor chars.
-    let mut widths = HEADERS.map(UnicodeWidthStr::width);
-    for row in &rows {
+    let mut widths = headers.map(UnicodeWidthStr::width);
+    for row in rows {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.width());
         }
     }
     let mut out = String::new();
-    write_row(&mut out, &widths, &HEADERS.map(str::to_owned));
-    for row in &rows {
+    write_row(&mut out, &widths, &headers.map(str::to_owned));
+    for row in rows {
         write_row(&mut out, &widths, row);
     }
     out
 }
 
 /// Trailing spaces after a command are invisible until someone copies the line.
-fn write_row(out: &mut String, widths: &[usize; 5], cells: &[String; 5]) {
+fn write_row<const N: usize>(out: &mut String, widths: &[usize; N], cells: &[String; N]) {
     for (index, cell) in cells.iter().enumerate() {
         out.push_str(cell);
         if index + 1 == cells.len() {
@@ -238,7 +345,7 @@ fn write_row(out: &mut String, widths: &[usize; 5], cells: &[String; 5]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use braid_proto::GridSize;
+    use braid_proto::{GridSize, RejectReason};
 
     fn summary(id: u8, command: &str) -> SessionSummary {
         SessionSummary {
@@ -304,12 +411,32 @@ mod tests {
         let mut idle = summary(0xbe, "vim a-very-long-file-name.rs");
         idle.size = GridSize { cols: 80, rows: 24 };
         idle.active_unix = 3_500;
+        let sessions = [shared, idle];
         assert_eq!(
-            table(&[shared, idle], 3_600 + 90),
+            table(HEADERS, &rows(&sessions, 3_600 + 90)),
             "\
 ID        SIZE    CLIENTS  IDLE  COMMAND
 1a1a1a1a  120x40  2        1m    -bash
 bebebebe  80x24   0        3m    vim a-very-long-file-name.rs
+"
+        );
+    }
+
+    /// One named session is enough for the column, and the unnamed one keeps its row.
+    #[test]
+    fn a_named_session_puts_its_name_beside_its_id() {
+        let sessions = [summary(0x1a, "-bash"), summary(0xbe, "-bash")];
+        let names = [SessionName {
+            session_id: SessionId::from_bytes([0xbe; 16]),
+            name: "deploy".into(),
+        }];
+        let rows = rows(&sessions, 0);
+        assert_eq!(
+            table(NAMED_HEADERS, &named(&sessions, &names, rows)),
+            "\
+ID        NAME    SIZE    CLIENTS  IDLE  COMMAND
+1a1a1a1a          120x40  0        0s    -bash
+bebebebe  deploy  120x40  0        0s    -bash
 "
         );
     }
@@ -355,5 +482,35 @@ bebebebe  80x24   0        3m    vim a-very-long-file-name.rs
             match_lines(&matches),
             "1a1a1a1a  error: no such file\nbebebebe  error: connection refused\n"
         );
+    }
+
+    /// The hangup is the only refusal this lane has, so it is the only failure `brd ls`
+    /// may answer with a table missing its NAME column.
+    #[test]
+    fn only_a_hangup_reads_as_a_daemon_too_old_to_name_sessions() {
+        let cases = [
+            (ClientError::Protocol(DecodeError::Truncated), true),
+            (
+                ClientError::Ssh("Connection closed by remote host".into()),
+                true,
+            ),
+            (ClientError::Protocol(DecodeError::InvalidField), false),
+            (ClientError::Protocol(DecodeError::BadTag(0x99)), false),
+            (ClientError::Remote(RejectReason::UnknownSession), false),
+            (
+                ClientError::Management("nothing to do with the wire".into()),
+                false,
+            ),
+        ];
+        for (error, expected) in cases {
+            let shown = error.to_string();
+            assert_eq!(hung_up(&error), expected, "{shown}");
+            let named = unnameable("host", error).to_string();
+            assert_eq!(
+                named.contains("too old to name sessions"),
+                expected,
+                "{shown} became {named}"
+            );
+        }
     }
 }

@@ -54,8 +54,9 @@ hides what you type never sends one.
 
 One host can run several sessions, and one session can carry several clients. Two
 terminals can attach to the same shell and watch each other type. `brd ls` lists the
-sessions, `brd attach` reaches one by any unambiguous prefix of its id, and `brd kill`
-ends one.
+sessions, `brd new` starts one beside them, `brd attach` reaches one by any unambiguous
+prefix of its id, and `brd kill` ends one. `brd rename` labels a session: the label
+lives with the session on the host, so every client that lists it sees the same name.
 
 Scrollback stays on the host. `brd grep host <pattern>` searches every session's
 scrollback on the far side and prints what matched, including lines that scrolled out of
@@ -90,9 +91,11 @@ reads `sun_path` bounds, umask, process groups and PTYs straight from the platfo
 ```console
 $ brd user@host                          # resume the newest session there, or start one
 $ brd user@host -- tmux attach           # run something other than a login shell
+$ brd new user@host                      # a session beside the ones already running
 $ brd ls user@host                       # what is running on that host
 $ brd attach user@host 3f9c              # an older session, by id prefix
 $ brd kill user@host 3f9c
+$ brd rename user@host 3f9c deploy       # label it; the name shows up in brd ls
 $ brd grep user@host 'error:'            # search every session's scrollback, remotely
 $ brd -L 8080:localhost:80 user@host     # a forward that survives reconnects
 $ brd -N -L 8080:localhost:80 user@host  # forwards only: no shell, backgrounds with &

@@ -8,10 +8,11 @@ use crate::inbound::{
     Deadline, DeadlineReader, Inbound, LINK_TIMEOUT, RESUME_TIMEOUT, next_forward_frame,
     silence_deadline,
 };
+use crate::log::log;
 use crate::outbound::{ClientWriter, Link};
 use crate::state::{CLIENT_ID, ReconnectState};
 use crate::transport::{Auth, Outbox, SshTransport, TransportError};
-use crate::{ClientError, Indicator, Reconnected, Reopen, reconnect, upgrade};
+use crate::{ClientError, Indicator, Reconnected, Reopen, Upgraded, reconnect, upgrade};
 use braid_proto::{
     ByteOff, ClientMessage, CmdSeq, DatagramOffer, DetachReason, MAX_FRAME, RejectReason,
     ServerMessage, Version, VersionRange, read_frame, write_message,
@@ -62,14 +63,18 @@ pub fn forward_only(destination: &str, forwards: &[ForwardSpec]) -> Result<(), C
         inbound: Inbound::ssh(opened.output, deadline.clone())?,
         transport: Some(opened.transport),
         version: opened.version,
+        offers_wanted: true,
     };
     let mut offer = opened.offer;
     loop {
         // So a client that migrates never reconciles two transports mid-stream.
-        if let Some((datagrams, spoken)) = upgrade(offer, &session.state, &deadline, &input)? {
-            session.inbound = datagrams;
-            session.version = spoken;
-            session.transport = None;
+        match upgrade(offer, &session.state, &deadline, &input)? {
+            Upgraded::Migrated(datagrams, spoken) => {
+                session.inbound = datagrams;
+                session.version = spoken;
+                session.transport = None;
+            }
+            Upgraded::Stayed => {}
         }
         // Ports held since before the handshake, so an early connection waits
         // in the backlog rather than being refused.
@@ -104,6 +109,8 @@ pub fn forward_only(destination: &str, forwards: &[ForwardSpec]) -> Result<(), C
             inbound: Inbound::ssh(resumed.output, deadline.clone())?,
             transport: Some(resumed.transport),
             version: resumed.version,
+            // A fresh session, so no resume of this client's has landed on it.
+            offers_wanted: true,
         };
         input.reopen(Link::Ssh(Outbox::new(resumed.input)), resumed.version)?;
         offer = resumed.offer;
@@ -117,6 +124,10 @@ struct Session {
     version: Version,
     /// Dropping it reaps the `ssh` process; a datagram upgrade makes it `None`.
     transport: Option<SshTransport>,
+    /// Cleared by a `Detached` naming one of this client's own resumes: that
+    /// frame is proof the resume landed with nothing coming back, so a second
+    /// offer would cost the attachment this one's relink is about to take.
+    offers_wanted: bool,
 }
 
 enum Ended {
@@ -208,7 +219,48 @@ fn serve(
 ) -> Result<Ended, ClientError> {
     // Otherwise a frame per forwarded chunk costs a fresh zeroed allocation.
     let mut payload = Vec::new();
+    // One re-establishment path, however the link was lost: a read that failed,
+    // or an attachment this client learned was already replaced. A `Detached`
+    // can arrive on a datagram link, where there is no read to fail and waiting
+    // for one costs the silence deadline.
+    let mut relink = false;
     loop {
+        if std::mem::take(&mut relink) {
+            // Every forward now holds bytes against a sink that refuses
+            // them, which is what the offset-keyed repair is for.
+            input.disconnect()?;
+            drop(session.transport.take());
+            match reconnect(
+                destination,
+                &Reopen::Session(&session.state),
+                input,
+                indicator,
+            )? {
+                Reconnected::Link(resumed) => {
+                    deadline.set(LINK_TIMEOUT);
+                    session.inbound = Inbound::ssh(resumed.output, deadline.clone())?;
+                    session.transport = Some(resumed.transport);
+                    session.version = resumed.version;
+                    input.reconnect(Link::Ssh(Outbox::new(resumed.input)), resumed.version)?;
+                    let offer = resumed.offer.filter(|_| session.offers_wanted);
+                    match upgrade(offer, &session.state, deadline, input)? {
+                        Upgraded::Migrated(datagrams, spoken) => {
+                            session.inbound = datagrams;
+                            session.version = spoken;
+                            session.transport = None;
+                        }
+                        Upgraded::Stayed => {}
+                    }
+                    // The pump thread cannot see this; without it a tunnel
+                    // waits for its next local byte.
+                    forwards.link_restored();
+                    eprintln!("[brd] link restored");
+                }
+                Reconnected::Closed => return Ok(Ended::Done),
+                Reconnected::Gone => return Ok(Ended::Gone),
+            }
+            continue;
+        }
         let frame = match next_forward_frame(&mut session.inbound, &mut payload) {
             Ok(frame) => frame,
             Err(error) if error.is_transport_loss() => {
@@ -217,37 +269,7 @@ fn serve(
                 if input.close_requested.load(Ordering::Acquire) {
                     return Ok(Ended::Done);
                 }
-                // Every forward now holds bytes against a sink that refuses
-                // them, which is what the offset-keyed repair is for.
-                input.disconnect()?;
-                drop(session.transport.take());
-                match reconnect(
-                    destination,
-                    &Reopen::Session(&session.state),
-                    input,
-                    indicator,
-                )? {
-                    Reconnected::Link(resumed) => {
-                        deadline.set(LINK_TIMEOUT);
-                        session.inbound = Inbound::ssh(resumed.output, deadline.clone())?;
-                        session.transport = Some(resumed.transport);
-                        session.version = resumed.version;
-                        input.reconnect(Link::Ssh(Outbox::new(resumed.input)), resumed.version)?;
-                        if let Some((datagrams, spoken)) =
-                            upgrade(resumed.offer, &session.state, deadline, input)?
-                        {
-                            session.inbound = datagrams;
-                            session.version = spoken;
-                            session.transport = None;
-                        }
-                        // The pump thread cannot see this; without it a tunnel
-                        // waits for its next local byte.
-                        forwards.link_restored();
-                        eprintln!("[brd] link restored");
-                    }
-                    Reconnected::Closed => return Ok(Ended::Done),
-                    Reconnected::Gone => return Ok(Ended::Gone),
-                }
+                relink = true;
                 continue;
             }
             Err(error) => return Err(ClientError::Protocol(error)),
@@ -287,16 +309,25 @@ fn serve(
             // the daemon never sends this. Ignored rather than refused: losing a
             // working tunnel over a diagnostic would be the worse trade.
             ServerMessage::OutputSkipped { .. } => {}
-            ServerMessage::Detached { reason } => {
-                drop(session.transport.take());
-                match reason {
-                    DetachReason::Requested => eprintln!("[brd] detached"),
-                    DetachReason::Replaced => {
-                        eprintln!("[brd] another client took over this session");
-                    }
+            ServerMessage::Detached { reason } => match reason {
+                DetachReason::Requested => {
+                    drop(session.transport.take());
+                    eprintln!("[brd] detached");
+                    return Ok(Ended::Done);
                 }
-                return Ok(Ended::Done);
-            }
+                // Never another client: the id a resume carries is drawn per
+                // process, so this names an attachment one of this client's own
+                // resumes replaced. The forwards outlive it, and ending here
+                // strands them on a link the daemon has already dropped.
+                DetachReason::Replaced => {
+                    log!("attachment replaced by this client's own resume; relinking");
+                    // Proof that the resume behind it arrived with nothing
+                    // coming back, so a further offer would cost the
+                    // attachment this relink is about to take.
+                    session.offers_wanted = false;
+                    relink = true;
+                }
+            },
             ServerMessage::Exit { code } => {
                 // The daemon holds its half of the attachment socket open while
                 // the reader thread parks, so waiting here would never return.
@@ -324,7 +355,8 @@ fn serve(
             | ServerMessage::Hello { .. }
             | ServerMessage::HelloForward { .. }
             | ServerMessage::SessionList { .. }
-            | ServerMessage::SearchResults { .. } => {
+            | ServerMessage::SearchResults { .. }
+            | ServerMessage::SessionNames { .. } => {
                 return Err(ClientError::Protocol(
                     braid_proto::DecodeError::InvalidField,
                 ));
@@ -600,6 +632,7 @@ mod tests {
             state: ReconnectState::new(SessionId::from_bytes([1; 16]), capability(2)),
             inbound: Inbound::ssh(from, deadline.clone()).expect("a pipe takes O_NONBLOCK"),
             transport: None,
+            offers_wanted: true,
         };
 
         let ended = serve(
@@ -632,5 +665,129 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    /// `Replaced` names an attachment one of this client's *own* resumes
+    /// displaced - no other client can, because the id a resume carries is
+    /// drawn per process. The session behind it is still running, so a client
+    /// that ends here strands a user's forwards on a link the daemon already
+    /// dropped: the frame is a reason to relink, not to stop.
+    ///
+    /// The close is requested up front so the relink settles on `reconnect`'s
+    /// own first check, which spawns no `ssh` at a name that does not resolve.
+    /// What proves the relink ran is the link epoch: tearing the writer down is
+    /// its first act, and no early return reaches it.
+    #[test]
+    fn an_attachment_this_client_replaced_relinks_rather_than_ending() {
+        let (inbound_child, mut daemon_says, from) = daemon();
+        let (outbound_child, client_writes, _client_said) = daemon();
+
+        let detached = ServerMessage::Detached {
+            reason: DetachReason::Replaced,
+        };
+        daemon_says
+            .write_all(&detached.encode(Version::LOCAL).expect("the frame encodes"))
+            .expect("the frame is carried");
+        daemon_says.flush().expect("the frame is carried");
+
+        let deadline = Deadline::new(Duration::from_secs(5));
+        let input = Arc::new(ClientWriter::new(
+            Link::Ssh(Outbox::new(client_writes)),
+            CmdSeq::first(),
+            Version::LOCAL,
+        ));
+        input.close_requested.store(true, Ordering::Release);
+        let epoch = input.epoch();
+        let listeners = Listeners::bind(&[ForwardSpec {
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            target: ForwardTarget {
+                host: "127.0.0.1".into(),
+                port: 9,
+            },
+        }])
+        .expect("a loopback port");
+        let forwards = Forwards::start(listeners, &input).expect("the forwards start");
+        let mut session = Session {
+            version: Version::LOCAL,
+            state: ReconnectState::new(SessionId::from_bytes([1; 16]), capability(2)),
+            inbound: Inbound::ssh(from, deadline.clone()).expect("a pipe takes O_NONBLOCK"),
+            transport: None,
+            offers_wanted: true,
+        };
+
+        let ended = serve(
+            "nowhere.invalid",
+            &mut session,
+            &deadline,
+            &input,
+            &forwards,
+            &Quiet::new(Vec::new()),
+        )
+        .expect("a replaced attachment is not a failure");
+        assert!(
+            matches!(ended, Ended::Done),
+            "the relink ended on the close this client had already asked for"
+        );
+        assert_ne!(
+            input.epoch(),
+            epoch,
+            "the session ended on the replaced attachment instead of relinking"
+        );
+        assert!(
+            !session.offers_wanted,
+            "a resume known to have landed must not be followed by another offer"
+        );
+
+        drop(forwards);
+        for mut child in [inbound_child, outbound_child] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// A resume that goes out unanswered proves nothing on its own: if it never
+    /// reached the daemon, the `ssh` attachment was never touched and the next
+    /// attachment's offer is worth exactly as much as this one's. Only the
+    /// `Detached` that a resume which *did* land produces is proof, and that
+    /// arrives on the link rather than out of this call — so nothing here may
+    /// report a spent offer as anything the caller can key a downgrade off.
+    ///
+    /// Reading it as one is what pins a roaming client to `ssh` for the rest of
+    /// the session because one datagram was dropped at attach time.
+    #[test]
+    fn a_resume_nothing_answers_is_not_a_reason_to_stop_offering() {
+        let (mut child, into, _from) = daemon();
+        // Bound and then dropped, which is what a firewalled datagram path looks like.
+        let port = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|socket| socket.local_addr())
+            .expect("a bound port")
+            .port();
+        let mut ip = [0; 16];
+        ip[10] = 0xff;
+        ip[11] = 0xff;
+        ip[12..].copy_from_slice(&[127, 0, 0, 1]);
+        let offer = DatagramOffer {
+            ip,
+            port,
+            cid: [3; 8],
+            secret: [4; 32],
+        };
+
+        let input = Arc::new(ClientWriter::new(
+            Link::Ssh(Outbox::new(into)),
+            CmdSeq::first(),
+            Version::LOCAL,
+        ));
+        let state = ReconnectState::new(SessionId::from_bytes([1; 16]), capability(2));
+        let upgraded = upgrade(Some(offer), &state, &Deadline::new(LINK_TIMEOUT), &input)
+            .expect("an offer nothing answers is not a failure");
+        assert!(
+            matches!(upgraded, Upgraded::Stayed),
+            "an unanswered resume left the caller something to downgrade on"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

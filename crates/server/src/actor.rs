@@ -660,7 +660,9 @@ impl SessionActor {
             | ClientMessage::Resume { .. }
             | ClientMessage::ListSessions
             | ClientMessage::KillSession { .. }
-            | ClientMessage::Search { .. } => {}
+            | ClientMessage::Search { .. }
+            | ClientMessage::RenameSession { .. }
+            | ClientMessage::ListNames => {}
         }
         false
     }

@@ -1,19 +1,26 @@
+use braid_client::Attach;
 use braid_client::forward::ForwardSpec;
 use braid_client::predict::Prediction;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: brd [--predict=MODE] [-L SPEC] <destination> [-- command ...]
        brd -N -L SPEC [-L SPEC ...] <destination>
+       brd new [--predict=MODE] [-L SPEC] <destination> [-- command ...]
        brd attach <destination> <id>
        brd ls <destination>
        brd kill <destination> <id>
+       brd rename <destination> <id> <name>
        brd grep <destination> <pattern>
        brd --help | --version
 
 `brd <destination>` resumes the newest session on that host, or starts one.
+`brd new` starts one beside whatever is already running there instead.
 `brd attach` names an older session by any unambiguous prefix of its id.
+`brd rename` labels a session for `brd ls` to print; the label belongs to the session
+rather than to this machine, so every client on that host sees it, and an empty name
+clears it.
 `brd grep` searches every session's scrollback on that host, where it lives.
 `--predict` is never, adaptive or always and defaults to adaptive: a keystroke
 is drawn before the session echoes it only on a link slow enough for the round
@@ -43,12 +50,7 @@ fn main() -> ExitCode {
         Ok(parsed) => parsed,
         Err(code) => return code,
     };
-    let Options {
-        chosen,
-        forwards,
-        headless,
-    } = options;
-    let prediction = match chosen {
+    let prediction = match options.chosen {
         Some(mode) => mode,
         None => match predict_env() {
             Ok(mode) => mode.unwrap_or_default(),
@@ -58,18 +60,16 @@ fn main() -> ExitCode {
     let Some(first) = first else {
         return usage();
     };
-    // These three open a management connection carrying no session for a
-    // forward to ride on.
-    if !forwards.is_empty()
-        && let Some(word @ ("ls" | "kill" | "grep")) = first.to_str()
-    {
-        eprintln!("brd: -L does not apply to `{word}`");
+    if let Some(refusal) = misapplied(&first, &options) {
+        eprintln!("brd: {refusal}");
         return ExitCode::from(MISUSE);
     }
-    if headless && let Some(word @ ("ls" | "kill" | "grep" | "attach")) = first.to_str() {
-        eprintln!("brd: -N does not apply to `{word}`");
-        return ExitCode::from(MISUSE);
-    }
+    let Options {
+        forwards,
+        headless,
+        fresh,
+        ..
+    } = options;
     match first.to_str() {
         Some("--help" | "-h") => {
             println!("{USAGE}");
@@ -82,24 +82,37 @@ fn main() -> ExitCode {
         // Both are invoked over `ssh` by this binary itself, never by a user.
         Some("--server") => report("brd server", braid_server::run_server()),
         Some("--daemon") => report("brd daemon", braid_server::run_daemon()),
-        Some("ls") => match destination(args.next()) {
-            Ok(destination) => report("brd", braid_client::manage::list(&destination)),
+        Some("ls") => match destination_and(&mut args, []) {
+            Ok((destination, [])) => report("brd", braid_client::manage::list(&destination)),
             Err(code) => code,
         },
-        Some("kill") => match destination_and(&mut args, "session id") {
-            Ok((destination, id)) => report("brd", braid_client::manage::kill(&destination, &id)),
+        Some("kill") => match destination_and(&mut args, ["session id"]) {
+            Ok((destination, [id])) => report("brd", braid_client::manage::kill(&destination, &id)),
             Err(code) => code,
         },
-        Some("grep") => match destination_and(&mut args, "pattern") {
-            Ok((destination, pattern)) => {
+        Some("rename") => match destination_and(&mut args, ["session id", "name"]) {
+            Ok((destination, [id, name])) => report(
+                "brd",
+                braid_client::manage::rename(&destination, &id, &name),
+            ),
+            Err(code) => code,
+        },
+        Some("grep") => match destination_and(&mut args, ["pattern"]) {
+            Ok((destination, [pattern])) => {
                 report("brd", braid_client::manage::grep(&destination, &pattern))
             }
             Err(code) => code,
         },
-        Some("attach") => match destination_and(&mut args, "session id") {
-            Ok((destination, id)) => report(
+        Some("attach") => match destination_and(&mut args, ["session id"]) {
+            Ok((destination, [id])) => report(
                 "brd",
-                braid_client::run(&destination, &[], Some(id.as_str()), prediction, &forwards),
+                braid_client::run(
+                    &destination,
+                    &[],
+                    Attach::Prefix(&id),
+                    prediction,
+                    &forwards,
+                ),
             ),
             Err(code) => code,
         },
@@ -114,7 +127,13 @@ fn main() -> ExitCode {
                 }
                 report(
                     "brd",
-                    braid_client::run(&destination, &command, None, prediction, &forwards),
+                    braid_client::run(
+                        &destination,
+                        &command,
+                        if fresh { Attach::Fresh } else { Attach::Newest },
+                        prediction,
+                        &forwards,
+                    ),
                 )
             }
             (Err(code), _) | (_, Err(code)) => code,
@@ -127,11 +146,18 @@ struct Options {
     chosen: Option<Prediction>,
     forwards: Vec<ForwardSpec>,
     headless: bool,
+    /// `new`. A word rather than a flag, but it selects what to attach to and stands
+    /// where an option stands, so it reads the same on either side of them.
+    fresh: bool,
 }
 
-/// The options, and the first word that is not one. Nothing after the
-/// destination is examined: `--` already separates the command.
-fn options(args: &mut env::ArgsOs) -> Result<(Options, Option<OsString>), ExitCode> {
+/// The options, and the first word that is not one. `new` is among them: it selects what
+/// to attach to rather than where, and a word that stands where an option stands reads
+/// the same on either side of the rest. Nothing after the destination is examined: `--`
+/// already separates the command.
+fn options<A: Iterator<Item = OsString>>(
+    args: &mut A,
+) -> Result<(Options, Option<OsString>), ExitCode> {
     let mut options = Options::default();
     let mut first = args.next();
     while let Some(argument) = first.as_ref().and_then(|argument| argument.to_str()) {
@@ -170,9 +196,37 @@ fn options(args: &mut env::ArgsOs) -> Result<(Options, Option<OsString>), ExitCo
             first = args.next();
             continue;
         }
+        if argument == "new" {
+            options.fresh = true;
+            first = args.next();
+            continue;
+        }
         break;
     }
     Ok((options, first))
+}
+
+/// The option that does not apply to the subcommand named, if this is such a pair.
+fn misapplied(first: &OsStr, options: &Options) -> Option<String> {
+    // `-N` already starts a session of its own every time: there is nothing for it to
+    // resume and nothing for `new` to add.
+    if options.headless && options.fresh {
+        return Some("-N does not apply to `new`".to_owned());
+    }
+    let word = first.to_str()?;
+    // These four open a management connection carrying no session for a
+    // forward to ride on.
+    if !options.forwards.is_empty() && matches!(word, "ls" | "kill" | "grep" | "rename") {
+        return Some(format!("-L does not apply to `{word}`"));
+    }
+    if options.headless && matches!(word, "ls" | "kill" | "grep" | "rename" | "attach") {
+        return Some(format!("-N does not apply to `{word}`"));
+    }
+    // `new` starts a session; every word here reaches one that is already running.
+    if options.fresh && matches!(word, "ls" | "kill" | "grep" | "rename" | "attach") {
+        return Some(format!("`new` does not apply to `{word}`"));
+    }
+    None
 }
 
 fn headless_refusal(command: &[String], forwards: &[ForwardSpec]) -> Option<&'static str> {
@@ -211,19 +265,45 @@ fn destination(argument: Option<OsString>) -> Result<String, ExitCode> {
     Ok(destination)
 }
 
-/// Both words are examined even when the first is wrong, so a command line
-/// with two mistakes says so about both.
-fn destination_and(rest: &mut env::ArgsOs, what: &str) -> Result<(String, String), ExitCode> {
-    match (destination(rest.next()), text(rest.next(), what)) {
-        (Ok(destination), Ok(Some(word))) => Ok((destination, word)),
-        (Ok(_), Ok(None)) => Err(usage()),
-        (Err(code), _) | (_, Err(code)) => Err(code),
+/// A destination and the `N` words after it, each named by what it is for. Every word is
+/// examined even when an earlier one is wrong, so a command line with two mistakes says
+/// so about both, and only one usage is printed however many are missing.
+fn destination_and<const N: usize>(
+    rest: &mut impl Iterator<Item = OsString>,
+    what: [&str; N],
+) -> Result<(String, [String; N]), ExitCode> {
+    let destination = destination(rest.next());
+    let words = what.map(|what| text(rest.next(), what));
+    // A name that needed quoting arrives as two words, and renaming a session to the
+    // first half of what was typed is worse than refusing the line.
+    let extra = rest.next().is_some();
+    let mut refusal = destination.as_ref().err().copied();
+    let mut given = [const { String::new() }; N];
+    let mut short = false;
+    for (slot, word) in given.iter_mut().zip(words) {
+        match word {
+            Ok(Some(word)) => *slot = word,
+            Ok(None) => short = true,
+            Err(code) => refusal = refusal.or(Some(code)),
+        }
     }
+    if let Some(code) = refusal {
+        return Err(code);
+    }
+    if short {
+        return Err(usage());
+    }
+    if extra {
+        let last = what.last().copied().unwrap_or("destination");
+        eprintln!("brd: unexpected argument after the {last}");
+        return Err(ExitCode::from(MISUSE));
+    }
+    Ok((destination?, given))
 }
 
 /// argv to run instead of the login shell. A bare word before the `--` is a
 /// typo, and taking it as part of the command would run it.
-fn command(mut rest: env::ArgsOs) -> Result<Vec<String>, ExitCode> {
+fn command(mut rest: impl Iterator<Item = OsString>) -> Result<Vec<String>, ExitCode> {
     let Some(separator) = rest.next() else {
         return Ok(Vec::new());
     };
@@ -293,6 +373,94 @@ mod tests {
                     "{refusal:?} does not name {named}"
                 ),
                 None => assert!(refusal.is_none(), "refused a forward it can carry"),
+            }
+        }
+    }
+
+    fn words(line: &[&str]) -> std::vec::IntoIter<OsString> {
+        line.iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    /// The usage line advertises `brd new --predict=never host`, and every other
+    /// subcommand takes its options before the word.
+    #[test]
+    fn new_reads_on_either_side_of_the_options_it_carries() {
+        for line in [
+            ["new", "--predict=never", "-L", "8080:localhost:80", "host"],
+            ["--predict=never", "-L", "8080:localhost:80", "new", "host"],
+        ] {
+            let mut args = words(&line);
+            let (parsed, first) = options(&mut args).expect("a well-formed command line");
+            assert!(
+                parsed.fresh,
+                "{line:?} did not ask for a session of its own"
+            );
+            assert_eq!(parsed.chosen, Some(Prediction::Never), "{line:?}");
+            assert_eq!(parsed.forwards.len(), 1, "{line:?}");
+            assert_eq!(first.as_deref(), Some(OsStr::new("host")), "{line:?}");
+        }
+    }
+
+    /// An unquoted two-word name arrives as two words, and renaming a session to the
+    /// first of them is a remote change nobody typed.
+    #[test]
+    fn a_word_past_the_last_one_asked_for_is_refused() {
+        let mut exact = words(&["host", "3f9c", "deploy"]);
+        let (destination, [id, name]) =
+            destination_and(&mut exact, ["session id", "name"]).expect("three words for three");
+        assert_eq!(
+            (destination.as_str(), id.as_str(), name.as_str()),
+            ("host", "3f9c", "deploy")
+        );
+        let mut extra = words(&["host", "3f9c", "my", "deploy"]);
+        assert!(
+            destination_and(&mut extra, ["session id", "name"]).is_err(),
+            "a fourth word renamed the session to `my`"
+        );
+        let mut listed = words(&["host", "3f9c"]);
+        assert!(
+            destination_and(&mut listed, []).is_err(),
+            "`brd ls` takes a destination and nothing else"
+        );
+    }
+
+    /// A forward rides on a session, `-N` is already a session of its own, and `new`
+    /// starts one where the management words reach one that is already running.
+    #[test]
+    fn an_option_that_cannot_apply_to_a_subcommand_names_both() {
+        let forwarded = |on: bool| {
+            on.then(|| ForwardSpec::parse("8080:localhost:80").expect("a well-formed spec"))
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let cases: [(&str, bool, bool, bool, Option<&str>); 7] = [
+            ("rename", true, false, false, Some("-L")),
+            ("ls", true, false, false, Some("-L")),
+            ("rename", false, true, false, Some("-N")),
+            ("ls", false, false, true, Some("new")),
+            ("attach", false, false, true, Some("new")),
+            ("host", false, true, true, Some("-N")),
+            ("host", true, false, true, None),
+        ];
+        for (word, forwards, headless, fresh, expected) in cases {
+            let options = Options {
+                chosen: None,
+                forwards: forwarded(forwards),
+                headless,
+                fresh,
+            };
+            let refusal = misapplied(OsStr::new(word), &options);
+            match expected {
+                Some(option) => assert!(
+                    refusal
+                        .as_deref()
+                        .is_some_and(|refusal| refusal.contains(option)),
+                    "{refusal:?} does not name {option} for `{word}`"
+                ),
+                None => assert!(refusal.is_none(), "`{word}` refused {refusal:?}"),
             }
         }
     }
