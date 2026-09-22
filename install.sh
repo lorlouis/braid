@@ -14,6 +14,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${BRD_PREFIX:-$HOME/.local/bin}"
 ZIG_CACHE="${BRD_ZIG_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/braid/zig}"
 ZIG_SYSTEM_DIR="${GHOSTTY_ZIG_SYSTEM_DIR:-}"
+ZIG_PACKAGE_CACHE="${ZIG_GLOBAL_CACHE_DIR:-}"
 
 usage() {
     cat <<EOF
@@ -25,8 +26,8 @@ usage: install.sh [--prefix DIR] [--zig-dir DIR] [--zig-system-dir DIR]
                         letting Zig fetch them. Also read from
                         GHOSTTY_ZIG_SYSTEM_DIR. Fill DIR on a host that can
                         reach the package hosts by running
-                        \`zig build --fetch=all\` in a Ghostty checkout, which
-                        writes its \`zig-pkg\`; copy that here.
+                        Ghostty's \`nix/build-support/fetch-zig-cache.sh\` with
+                        ZIG_GLOBAL_CACHE_DIR set; pass its \`p\` directory here.
 
 A host \`zig\` is used when its major and minor match $ZIG_VERSION. Otherwise that
 release is downloaded, checksum-verified, and used for this build alone; it is
@@ -34,6 +35,9 @@ never installed system-wide.
 
 Ghostty's source is fetched by \`libghostty-vt-sys\`'s build script at the commit
 that crate pins, so the build needs network access to github.com.
+
+If Zig cannot fetch HTTPS through a TLS-intercepting proxy but curl can, the
+installer automatically fills a private Zig package cache with curl and retries.
 EOF
 }
 
@@ -46,6 +50,12 @@ while [ $# -gt 0 ]; do
         *) printf 'install.sh: unknown argument %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+[ -n "$ZIG_PACKAGE_CACHE" ] || ZIG_PACKAGE_CACHE="$ZIG_CACHE/packages-$ZIG_VERSION"
+case "$ZIG_PACKAGE_CACHE" in
+    /*) ;;
+    *) ZIG_PACKAGE_CACHE="$PWD/$ZIG_PACKAGE_CACHE" ;;
+esac
 
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 note() { printf '==> %s\n' "$*"; }
@@ -182,6 +192,211 @@ ensure_zig() {
     ZIG_DIR="$dir"
 }
 
+# `zig fetch` requires a build.zig in the current directory even when its input
+# is an explicit URL or local path.
+zig_scratch_project() {
+    printf 'const std = @import("std");\npub fn build(b: *std.Build) void {\n    _ = b;\n}\n' \
+        > "$1/build.zig"
+}
+
+# The failed Cargo build leaves the exact pinned Ghostty checkout in OUT_DIR.
+# Pick the checkout from the most recently invoked build script without relying
+# on GNU find extensions (the installer also runs on macOS).
+ghostty_source() {
+    local candidate stamp newest="" newest_stamp=""
+    if [ -n "${GHOSTTY_SOURCE_DIR:-}" ] \
+        && [ -f "$GHOSTTY_SOURCE_DIR/build.zig.zon.txt" ] \
+        && [ -f "$GHOSTTY_SOURCE_DIR/build.zig.zon.json" ]
+    then
+        printf '%s' "$GHOSTTY_SOURCE_DIR"
+        return
+    fi
+    for candidate in "$REPO_ROOT"/target/release/build/libghostty-vt-sys-*/out/ghostty-src; do
+        [ -f "$candidate/build.zig.zon.txt" ] || continue
+        [ -f "$candidate/build.zig.zon.json" ] || continue
+        stamp="${candidate%/out/ghostty-src}/invoked.timestamp"
+        if [ -z "$newest" ] \
+            || { [ -e "$stamp" ] && { [ ! -e "$newest_stamp" ] || [ "$stamp" -nt "$newest_stamp" ]; }; }
+        then
+            newest="$candidate"
+            newest_stamp="$stamp"
+        fi
+    done
+    [ -n "$newest" ] && printf '%s' "$newest"
+}
+
+archive_extension() {
+    case "${1%%\?*}" in
+        *.tar.xz)  printf '.tar.xz' ;;
+        *.tar.zst) printf '.tar.zst' ;;
+        *.tgz)     printf '.tgz' ;;
+        *)         printf '.tar.gz' ;;
+    esac
+}
+
+# Hash local package content into Zig's cache. The hash must be one Ghostty
+# pinned in its generated transitive lock data; the later build checks the same
+# hash when resolving the package.
+cache_zig_package() {
+    local source="$1" scratch="$2" manifest="$3" got error_file
+    [ -n "$scratch" ] && [ -d "$scratch" ] || return 1
+    error_file="$scratch/zig-fetch.err"
+    if ! got="$(cd "$scratch" && zig fetch \
+        --global-cache-dir "$ZIG_PACKAGE_CACHE" "$source" 2>"$error_file")"
+    then
+        warn "zig could not cache $source: $(<"$error_file")"
+        return 1
+    fi
+    if [ -z "$got" ] || ! grep -Fq "\"$got\":" "$manifest"; then
+        warn "downloaded package produced an unpinned Zig hash: ${got:-<none>}"
+        return 1
+    fi
+    printf '    %s\n' "$got"
+}
+
+prefetch_zig_archive() {
+    local url="$1" scratch="$2" manifest="$3" extension archive
+    [ -n "$scratch" ] && [ -d "$scratch" ] || return 1
+    extension="$(archive_extension "$url")"
+    archive="$scratch/package$extension"
+    rm -f "$scratch"/package.*
+    if ! download "$url" "$archive"; then
+        warn "failed to download $url"
+        return 1
+    fi
+    cache_zig_package "$archive" "$scratch" "$manifest"
+}
+
+prefetch_zig_git() {
+    local spec="$1" scratch="$2" manifest="$3" repo commit checkout resolved
+    [ -n "$scratch" ] && [ -d "$scratch" ] || return 1
+    spec="${spec#git+}"
+    repo="${spec%%#*}"
+    commit="${spec##*#}"
+    if [ "$repo" = "$commit" ] || [ -z "$commit" ]; then
+        warn "invalid pinned Zig git dependency: $spec"
+        return 1
+    fi
+
+    checkout="$scratch/git-package"
+    rm -rf "$checkout"
+    git init --quiet "$checkout"
+    if ! git -C "$checkout" fetch --quiet --depth=1 "$repo" "$commit" \
+        || ! git -C "$checkout" checkout --quiet --detach FETCH_HEAD
+    then
+        warn "failed to fetch Zig git dependency $repo at $commit"
+        return 1
+    fi
+    resolved="$(git -C "$checkout" rev-parse HEAD)"
+    if [ "$resolved" != "$commit" ]; then
+        warn "Zig git dependency resolved to $resolved instead of $commit"
+        return 1
+    fi
+    rm -rf "$checkout/.git"
+    cache_zig_package "$checkout" "$scratch" "$manifest"
+}
+
+# Ghostty's generated URL list is already the complete transitive closure. This
+# avoids both Zig's incomplete transitive fetch mode and recursively parsing ZON.
+prefetch_zig_packages() {
+    local source="$1" list manifest scratch url
+    list="$source/build.zig.zon.txt"
+    manifest="$source/build.zig.zon.json"
+    if ! scratch="$(mktemp -d "${TMPDIR:-/tmp}/brd-zig-fetch.XXXXXX")" \
+        || [ -z "$scratch" ] \
+        || [ ! -d "$scratch" ]
+    then
+        warn "cannot create a temporary directory for Zig packages"
+        return 1
+    fi
+    if ! zig_scratch_project "$scratch" || ! mkdir -p "$ZIG_PACKAGE_CACHE"; then
+        warn "cannot prepare the Zig package cache"
+        rm -rf "$scratch"
+        return 1
+    fi
+
+    note "pre-fetching Ghostty's Zig packages with curl"
+    while IFS= read -r url || [ -n "$url" ]; do
+        [ -n "$url" ] || continue
+        case "$url" in
+            https://*)
+                if ! prefetch_zig_archive "$url" "$scratch" "$manifest"; then
+                    rm -rf "$scratch"
+                    return 1
+                fi
+                ;;
+            git+https://*)
+                if ! prefetch_zig_git "$url" "$scratch" "$manifest"; then
+                    rm -rf "$scratch"
+                    return 1
+                fi
+                ;;
+            *)
+                warn "unsupported Zig dependency URL: $url"
+                rm -rf "$scratch"
+                return 1
+                ;;
+        esac
+    done < "$list"
+
+    rm -rf "$scratch"
+}
+
+# True only when Zig cannot fetch a real Ghostty archive but the system TLS
+# stack can download it and Zig can consume that local copy. An isolated cache
+# prevents an earlier fetch from hiding a broken network path.
+zig_needs_curl() {
+    local source="$1" scratch="" seen_hosts="" url host extension archive got
+    if ! scratch="$(mktemp -d "${TMPDIR:-/tmp}/brd-zig-probe.XXXXXX")" \
+        || [ -z "$scratch" ] \
+        || [ ! -d "$scratch" ]
+    then
+        warn "cannot create a temporary directory for the Zig network probe"
+        return 1
+    fi
+    if ! zig_scratch_project "$scratch"; then
+        warn "cannot prepare the Zig network probe"
+        rm -rf "$scratch"
+        return 1
+    fi
+
+    # One real package per host catches a proxy or certificate path that only
+    # affects GitHub or deps.files.ghostty.org without downloading every package.
+    while IFS= read -r url || [ -n "$url" ]; do
+        case "$url" in https://*) ;; *) continue ;; esac
+        host="${url#https://}"
+        host="${host%%/*}"
+        case " $seen_hosts " in *" $host "*) continue ;; esac
+        seen_hosts="$seen_hosts $host"
+
+        if (cd "$scratch" && zig fetch \
+            --global-cache-dir "$scratch/remote-cache" "$url") >/dev/null 2>&1
+        then
+            continue
+        fi
+
+        extension="$(archive_extension "$url")"
+        archive="$scratch/probe$extension"
+        rm -f "$scratch"/probe.*
+        if ! download "$url" "$archive"; then
+            warn "Zig and curl both failed to download from $host"
+            continue
+        fi
+        if got="$(cd "$scratch" && zig fetch \
+            --global-cache-dir "$scratch/local-cache" "$archive" 2>/dev/null)" \
+            && [ -n "$got" ] \
+            && grep -Fq "\"$got\":" "$source/build.zig.zon.json"
+        then
+            rm -rf "$scratch"
+            return 0
+        fi
+        warn "curl downloaded from $host, but Zig could not verify the local package"
+    done < "$source/build.zig.zon.txt"
+
+    rm -rf "$scratch"
+    return 1
+}
+
 # Every `brd` on this PATH, in order. An SSH login resolves `brd --server`
 # through its own PATH, so any stale copy is a candidate, and one speaking an
 # older protocol fails as "stream ended before a complete frame" with the
@@ -195,7 +410,9 @@ report_path_conflicts() {
     for dir in "${dirs[@]}"; do
         [ -n "$dir" ] || dir="."
         candidate="$dir/brd"
-        [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+        if [ ! -f "$candidate" ] || [ ! -x "$candidate" ]; then
+            continue
+        fi
         for known in ${seen[@]+"${seen[@]}"}; do
             [ "$known" = "$candidate" ] && continue 2
         done
@@ -237,30 +454,46 @@ if [ -n "$ZIG_SYSTEM_DIR" ]; then
     [ -d "$ZIG_SYSTEM_DIR" ] || die "no such directory: $ZIG_SYSTEM_DIR"
     export GHOSTTY_ZIG_SYSTEM_DIR="$ZIG_SYSTEM_DIR"
     note "resolving Zig packages from $ZIG_SYSTEM_DIR"
+else
+    mkdir -p "$ZIG_PACKAGE_CACHE"
+    export ZIG_GLOBAL_CACHE_DIR="$ZIG_PACKAGE_CACHE"
 fi
 
-# Zig 0.16 cannot verify a P-521 CA and ignores SSL_CERT_{FILE,DIR}, so behind a
-# TLS-intercepting proxy it fetches nothing. Detecting that from here means
-# matching error strings a Zig release is free to rename, so the escape hatch is
-# named instead of inferred.
 build_failed() {
     printf '\n' >&2
     warn "the release build failed."
-    warn "if Zig reported a TLS or certificate error, it could not fetch its own"
-    warn "packages: Zig $ZIG_VERSION cannot verify a P-521 CA and ignores"
-    warn "SSL_CERT_FILE and SSL_CERT_DIR, so a TLS-intercepting proxy blocks every"
-    warn "fetch. On a host that can reach deps.files.ghostty.org, fill a package"
-    warn "directory — \`=all\` because \`--system\` refuses to fetch even a lazy"
-    warn "dependency, so the store has to be complete:"
-    printf '\n        cd /path/to/ghostty && zig build --fetch=all\n' >&2
-    printf '        # writes ./zig-pkg\n\n' >&2
+    warn "automatic curl fallback only handles Zig package download failures."
+    warn "to prepare a complete package directory on another host:"
+    printf '\n        cd /path/to/ghostty\n' >&2
+    printf '        ZIG_GLOBAL_CACHE_DIR=/tmp/ghostty-zig ./nix/build-support/fetch-zig-cache.sh\n\n' >&2
     warn "copy that directory to this host and build against it:"
-    printf '\n        %s --zig-system-dir DIR\n\n' "$0" >&2
+    printf '\n        %s --zig-system-dir /path/to/ghostty-zig/p\n\n' "$0" >&2
     exit 1
 }
 
 note "building brd (the first Zig build takes a few minutes)"
-cargo build --release --locked --manifest-path "$REPO_ROOT/Cargo.toml" || build_failed
+if ! cargo build --release --locked --manifest-path "$REPO_ROOT/Cargo.toml"; then
+    [ -z "$ZIG_SYSTEM_DIR" ] || build_failed
+
+    ghostty_dir="$(ghostty_source || true)"
+    if [ -z "$ghostty_dir" ]; then
+        warn "Cargo failed before materializing Ghostty's package metadata"
+        build_failed
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "curl is required for the Zig TLS fallback"
+        build_failed
+    fi
+    if ! zig_needs_curl "$ghostty_dir"; then
+        warn "Zig can fetch Ghostty packages, or curl cannot provide a usable replacement"
+        build_failed
+    fi
+
+    note "Zig cannot fetch Ghostty packages directly; curl can"
+    prefetch_zig_packages "$ghostty_dir" || build_failed
+    note "retrying the release build with the local Zig package cache"
+    cargo build --release --locked --manifest-path "$REPO_ROOT/Cargo.toml" || build_failed
+fi
 
 mkdir -p "$PREFIX"
 install -m 0755 "$REPO_ROOT/target/release/brd" "$PREFIX/brd"

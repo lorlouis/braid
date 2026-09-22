@@ -72,7 +72,8 @@ happened.
 Requires a current stable Rust, Zig 0.16.x, and network access to github.com. The
 terminal emulator is [libghostty](https://github.com/ghostty-org/ghostty), built from
 source by a dependency's build script. `install.sh` will fetch and checksum a private Zig
-toolchain if the host doesn't have a matching one.
+toolchain if the host doesn't have a matching one. If Zig's TLS cannot fetch Ghostty's
+packages through an intercepting proxy, the installer fills its package cache with curl.
 
 ```console
 $ git clone https://github.com/fbernier/braid && cd braid
