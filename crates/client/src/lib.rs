@@ -1122,6 +1122,38 @@ fn farewell<W: FrameSink>(end: &InputEnd, output: &ClientWriter<W>) -> Result<()
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KittyPrefixEvent {
+    Press,
+    Repeat,
+    Release,
+}
+
+fn kitty_ctrl_bracket(input: &[u8]) -> Option<(KittyPrefixEvent, usize)> {
+    const INTRO: &[u8] = b"\x1b[93;";
+    let rest = input.strip_prefix(INTRO)?;
+    let end = rest.iter().position(|byte| *byte == b'u')?;
+    let params = &rest[..end];
+    let (modifiers, event) = match params.iter().position(|byte| *byte == b':') {
+        Some(colon) => (&params[..colon], &params[colon + 1..]),
+        None => (params, &b"1"[..]),
+    };
+    let event = match event {
+        b"1" => KittyPrefixEvent::Press,
+        b"2" => KittyPrefixEvent::Repeat,
+        b"3" => KittyPrefixEvent::Release,
+        _ => return None,
+    };
+    let ctrl = matches!(modifiers, b"5" | b"69" | b"133" | b"197");
+    let release = event == KittyPrefixEvent::Release
+        && !modifiers.is_empty()
+        && modifiers.iter().all(u8::is_ascii_digit);
+    if !ctrl && !release {
+        return None;
+    }
+    Some((event, INTRO.len() + end + 1))
+}
+
 fn input_loop<R: Read, W: FrameSink, D: Write>(
     mut input: R,
     output: &ClientWriter<W>,
@@ -1130,7 +1162,8 @@ fn input_loop<R: Read, W: FrameSink, D: Write>(
 ) -> InputEnd {
     let mut bytes = [0_u8; 4096];
     let mut pending = Vec::with_capacity(bytes.len());
-    let mut detach_prefix = false;
+    let mut detach_prefix: Option<Vec<u8>> = None;
+    let mut escaped_kitty_prefix = false;
     let end = loop {
         let count = match input.read(&mut bytes) {
             Ok(0) => break InputEnd::Closed,
@@ -1142,13 +1175,39 @@ fn input_loop<R: Read, W: FrameSink, D: Write>(
             Ok(count) => count,
         };
         pending.clear();
-        for &byte in &bytes[..count] {
-            if detach_prefix {
-                detach_prefix = false;
-                match byte {
-                    b'r' => {
-                        let _ = output.request_repaint();
+        let mut offset = 0;
+        while offset < count {
+            let rest = &bytes[offset..count];
+            if let Some((event, len)) = kitty_ctrl_bracket(rest) {
+                let encoded = &rest[..len];
+                offset += len;
+                if escaped_kitty_prefix && event != KittyPrefixEvent::Press {
+                    escaped_kitty_prefix = event != KittyPrefixEvent::Release;
+                    continue;
+                }
+                escaped_kitty_prefix = false;
+                match (event, detach_prefix.take()) {
+                    (KittyPrefixEvent::Press, Some(prefix)) => {
+                        pending.extend_from_slice(&prefix);
+                        escaped_kitty_prefix = true;
                     }
+                    (KittyPrefixEvent::Press, None) => detach_prefix = Some(encoded.to_vec()),
+                    (KittyPrefixEvent::Repeat, Some(prefix)) => detach_prefix = Some(prefix),
+                    (KittyPrefixEvent::Release, Some(mut prefix)) => {
+                        prefix.extend_from_slice(encoded);
+                        detach_prefix = Some(prefix);
+                    }
+                    (KittyPrefixEvent::Repeat | KittyPrefixEvent::Release, None) => {
+                        pending.extend_from_slice(encoded);
+                    }
+                }
+                continue;
+            }
+            let byte = rest[0];
+            offset += 1;
+            if let Some(prefix) = detach_prefix.take() {
+                match byte {
+                    b'r' => _ = output.request_repaint(),
                     b'd' | b'.' => {
                         // Typing ahead of the binding is still input, not part of it.
                         if !pending.is_empty() && output.input(&pending).is_err() {
@@ -1171,15 +1230,15 @@ fn input_loop<R: Read, W: FrameSink, D: Write>(
                         interrupted.store(true, Ordering::Release);
                         let _ = signal_hook::low_level::raise(signal_hook::consts::SIGTSTP);
                     }
-                    // The prefix escapes itself: two presses send one 0x1d.
-                    0x1d => pending.push(0x1d),
+                    // The prefix escapes itself: two presses send one prefix.
+                    0x1d => pending.extend_from_slice(&prefix),
                     other => {
-                        pending.push(0x1d);
+                        pending.extend_from_slice(&prefix);
                         pending.push(other);
                     }
                 }
             } else if byte == 0x1d {
-                detach_prefix = true;
+                detach_prefix = Some(vec![byte]);
             } else {
                 pending.push(byte);
             }
@@ -1210,8 +1269,8 @@ fn input_loop<R: Read, W: FrameSink, D: Write>(
         }
     };
     // A prefix key typed with nothing after it is still a keystroke.
-    if detach_prefix {
-        let _ = output.input(&[0x1d]);
+    if let Some(prefix) = detach_prefix {
+        let _ = output.input(&prefix);
     }
     end
 }
@@ -1569,6 +1628,13 @@ mod tests {
             ),
             (&b"\x1d."[..], InputEnd::Closed, vec![close.clone()]),
             (
+                &b"\x1b[93;197:1u\x1b[93;197:3ud"[..],
+                InputEnd::Detached,
+                vec![ClientMessage::Detach {
+                    seq: CmdSeq::first(),
+                }],
+            ),
+            (
                 &b"\x1dr"[..],
                 InputEnd::Closed,
                 vec![
@@ -1584,6 +1650,14 @@ mod tests {
                 InputEnd::Closed,
                 vec![input_of(1, &[0x1d]), ClientMessage::Close { seq: seq(2) }],
             ),
+            (
+                &b"\x1b[93;5u\x1b[93;1:3u\x1b[93;5u\x1b[93;1:3u"[..],
+                InputEnd::Closed,
+                vec![
+                    input_of(1, b"\x1b[93;5u\x1b[93;1:3u"),
+                    ClientMessage::Close { seq: seq(2) },
+                ],
+            ),
         ] {
             let writer = stream_writer();
             let ended = typed(keys, &writer, &terminal());
@@ -1594,6 +1668,32 @@ mod tests {
             );
             assert_eq!(messages(&written(&writer)), sent, "{keys:?}");
         }
+    }
+
+    #[test]
+    fn kitty_quit_survives_a_lost_transport() {
+        let display = terminal();
+        let writer = stream_writer();
+        writer.disconnect().expect("disconnect transport");
+        let input = Cursor::new(b"\x1b[93;5u\x1b[93;5:2u\x1b[93;2:3u.".to_vec())
+            .chain(Unreadable(io::ErrorKind::ConnectionReset));
+
+        assert!(matches!(drive(input, &writer, &display), InputEnd::Closed));
+    }
+
+    #[test]
+    fn an_unbound_kitty_prefix_is_forwarded_verbatim() {
+        let writer = stream_writer();
+        let input = b"\x1b[93;69:1u\x1b[93;69:3ux";
+
+        assert!(matches!(
+            typed(input, &writer, &terminal()),
+            InputEnd::Closed
+        ));
+        assert_eq!(
+            messages(&written(&writer)),
+            vec![input_of(1, input), ClientMessage::Close { seq: seq(2) }]
+        );
     }
 
     fn whole_screen(size: GridSize, version: ScreenVersion, rows: &[&str]) -> ScreenPart {
